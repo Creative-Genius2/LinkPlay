@@ -1,0 +1,21 @@
+# Python dependencies (installed via uv/pip)
+mcp
+ndspy>=4.0.0
+undetected-chromedriver  # For bypassing Cloudflare protection when downloading tools
+rarfile  # For extracting RAR archives
+
+# External compression tools (auto-downloaded by setup_tools.py):
+# - blz.exe (BLZ compression for ARM9/overlays)
+# - lzss.exe (LZ10 compression)
+# - lzx.exe (LZ11/LZ40 compression)
+# - huffman.exe (Huffman 4-bit and 8-bit compression)
+# - rle.exe (RLE compression)
+#
+# Source: CUE's DS/GBA Compressors (GPL licensed)
+# https://www.romhacking.net/utilities/826/
+#
+# Download strategy:
+# 1. Check if RAR file exists in user's Downloads folder
+# 2. If not, use Selenium with undetected-chromedriver to bypass Cloudflare
+# 3. Extract using 7-Zip command-line tool
+# Manual installation instructions in INSTALL.md if auto-download fails.

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "linkplay": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:\\Users\\prado\\Downloads\\LinkPlay",
+        "run",
+        "python",
+        "scripts/server.py"
+      ]
+    }
+  },
+  "preferences": {
+    "sidebarMode": "chat"
+  }
+}
