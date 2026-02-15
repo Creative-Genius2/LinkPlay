@@ -622,15 +622,29 @@ def decode_gen5_text(data: bytes, mult: int = 0x2983) -> list:
 
 
 # Game info — gen + NARC role mappings. Roles auto-drive _auto_decode.
-_GEN5_BASE = {
+_GEN5_B2W2 = {
     'text': 'a/0/0/2',
     'trdata': 'a/0/9/1',
     'trpoke': 'a/0/9/2',
-    'encounters': 'a/0/8/2',
     'personal': 'a/0/1/6',
     'learnsets': 'a/0/1/8',
     'evolutions': 'a/0/1/9',
     'move_data': 'a/0/2/1',
+}
+_GEN5_BW1 = {
+    'text': 'a/0/0/2',
+    'trdata': 'a/0/9/2',  # Different from B2W2!
+    'trpoke': 'a/0/9/3',  # Different from B2W2!
+    'personal': 'a/0/1/6',
+    'learnsets': 'a/0/1/8',
+    'evolutions': 'a/0/1/9',
+    'move_data': 'a/0/2/1',
+}
+_BW1_ENCOUNTERS = {
+    'encounters': 'a/1/2/6',  # 112 files, 232 bytes each
+}
+_B2W2_ENCOUNTERS = {
+    'encounters': 'a/1/2/7',  # 135 files, 232 or 928 bytes (seasonal)
 }
 _B2W2_PWT = {
     'pwt_rental': 'a/2/5/0',           # 1000 pokemon pools (16 bytes each)
@@ -679,16 +693,18 @@ _GEN4_HGSS = {
     'move_data': 'a/0/1/1',
     'trdata': 'a/0/5/5',
     'trpoke': 'a/0/5/6',
-    'battle_tower_pokemon': 'a/1/2/9',
-    'battle_tower_trainers': 'a/1/2/8',
+    'encounters': 'a/0/3/7',  # 142 files, 196 bytes each
+    'battle_tower_pokemon': 'a/2/0/3',   # Real Pt-era data (a/1/2/9 is DP leftover)
+    'battle_tower_trainers': 'a/2/0/2', # Real Pt-era data (a/1/2/8 is DP leftover)
+    'pokeathlon_performance': 'a/1/6/9', # Pokéathlon performance stats (554 entries, 20B each)
 }
 
 GAME_INFO = {
     # Gen V
-    'IRE': {'gen': 5, 'narcs': {**_GEN5_BASE, **_B2W2_PWT, **_B2W2_SUBWAY}},  # Black 2
-    'IRD': {'gen': 5, 'narcs': {**_GEN5_BASE, **_B2W2_PWT, **_B2W2_SUBWAY}},  # White 2
-    'IRB': {'gen': 5, 'narcs': {**_GEN5_BASE, **_BW1_SUBWAY}},  # Black
-    'IRA': {'gen': 5, 'narcs': {**_GEN5_BASE, **_BW1_SUBWAY}},  # White
+    'IRE': {'gen': 5, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # Black 2
+    'IRD': {'gen': 5, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # White 2
+    'IRB': {'gen': 5, 'narcs': {**_GEN5_BW1, **_BW1_ENCOUNTERS, **_BW1_SUBWAY}},  # Black
+    'IRA': {'gen': 5, 'narcs': {**_GEN5_BW1, **_BW1_ENCOUNTERS, **_BW1_SUBWAY}},  # White
     # Gen IV — Diamond/Pearl
     'ADA': {'gen': 4, 'narcs': {**_GEN4_COMMON,
         'text': 'msgdata/msg.narc',
@@ -714,19 +730,20 @@ GAME_INFO = {
 # Content fingerprints — universal across all Pokemon games.
 # (entry_index, expected_string) pairs that ALL must match.
 TABLE_FINGERPRINTS = {
-    'species':    [(1, "Bulbasaur"), (4, "Charmander")],
-    'moves':      [(1, "Pound"), (5, "Mega Punch")],
-    'items':      [(1, "Master Ball"), (17, "Potion")],
-    'abilities':  [(1, "Stench"), (22, "Intimidate")],
-    'natures':    [(0, "Hardy"), (1, "Lonely"), (3, "Adamant")],
-    'type_names': [(0, "Normal"), (1, "Fighting"), (2, "Flying")],
+    'species':        [(1, "Bulbasaur"), (4, "Charmander")],
+    'moves':          [(1, "Pound"), (5, "Mega Punch")],
+    'items':          [(1, "Master Ball"), (17, "Potion")],
+    'abilities':      [(1, "Stench"), (22, "Intimidate")],
+    'natures':        [(0, "Hardy"), (1, "Lonely"), (3, "Adamant")],
+    'type_names':     [(0, "Normal"), (1, "Fighting"), (2, "Flying")],
 }
 
 # Heuristic markers — tables without unique index-based fingerprints.
 # All listed strings must appear SOMEWHERE in the file.
+# location_names uses per-game markers since regions have different cities/routes.
 HEURISTIC_MARKERS = {
-    'trainer_classes': ["Youngster", "Lass", "Bug Catcher"],
-    'location_names':  ["Route 1", "Route 2", "Route 3"],
+    'trainer_classes': ["Youngster", "Lass", "School Kid"],
+    'location_names':  ["Mystery Zone"],
 }
 
 
@@ -742,7 +759,7 @@ def auto_detect_tables() -> dict:
         for table_name, markers in TABLE_FINGERPRINTS.items():
             if table_name in found:
                 continue
-            if all(idx < len(strings) and strings[idx] == expected for idx, expected in markers):
+            if all(idx < len(strings) and strings[idx].strip().upper() == expected.upper() for idx, expected in markers):
                 text_tables[table_name] = strings
                 found[table_name] = file_idx
 
@@ -751,11 +768,11 @@ def auto_detect_tables() -> dict:
         strings = text_tables[file_idx]
         if not isinstance(strings, list):
             continue
-        string_set = set(strings)
+        string_set_upper = set(s.strip().upper() for s in strings if isinstance(s, str))
         for table_name, markers in HEURISTIC_MARKERS.items():
             if table_name in found:
                 continue
-            if all(m in string_set for m in markers):
+            if all(m.upper() in string_set_upper for m in markers):
                 text_tables[table_name] = strings
                 found[table_name] = file_idx
 
@@ -790,11 +807,145 @@ def auto_detect_tables() -> dict:
     return found
 
 
+# Gen IV complete character map
+# Based on Bulbapedia: https://bulbapedia.bulbagarden.net/wiki/Character_encoding_(Generation_IV)
+
+# Hiragana (0x0001-0x004F)
+_GEN4_HIRAGANA = {
+    0x0001: '　', 0x0002: 'ぁ', 0x0003: 'あ', 0x0004: 'ぃ', 0x0005: 'い',
+    0x0006: 'ぅ', 0x0007: 'う', 0x0008: 'ぇ', 0x0009: 'え', 0x000A: 'ぉ',
+    0x000B: 'お', 0x000C: 'か', 0x000D: 'が', 0x000E: 'き', 0x000F: 'ぎ',
+    0x0010: 'く', 0x0011: 'ぐ', 0x0012: 'け', 0x0013: 'げ', 0x0014: 'こ',
+    0x0015: 'ご', 0x0016: 'さ', 0x0017: 'ざ', 0x0018: 'し', 0x0019: 'じ',
+    0x001A: 'す', 0x001B: 'ず', 0x001C: 'せ', 0x001D: 'ぜ', 0x001E: 'そ',
+    0x001F: 'ぞ', 0x0020: 'た', 0x0021: 'だ', 0x0022: 'ち', 0x0023: 'ぢ',
+    0x0024: 'っ', 0x0025: 'つ', 0x0026: 'づ', 0x0027: 'て', 0x0028: 'で',
+    0x0029: 'と', 0x002A: 'ど', 0x002B: 'な', 0x002C: 'に', 0x002D: 'ぬ',
+    0x002E: 'ね', 0x002F: 'の', 0x0030: 'は', 0x0031: 'ば', 0x0032: 'ぱ',
+    0x0033: 'ひ', 0x0034: 'び', 0x0035: 'ぴ', 0x0036: 'ふ', 0x0037: 'ぶ',
+    0x0038: 'ぷ', 0x0039: 'へ', 0x003A: 'べ', 0x003B: 'ぺ', 0x003C: 'ほ',
+    0x003D: 'ぼ', 0x003E: 'ぽ', 0x003F: 'ま', 0x0040: 'み', 0x0041: 'む',
+    0x0042: 'め', 0x0043: 'も', 0x0044: 'ゃ', 0x0045: 'や', 0x0046: 'ゅ',
+    0x0047: 'ゆ', 0x0048: 'ょ', 0x0049: 'よ', 0x004A: 'ら', 0x004B: 'り',
+    0x004C: 'る', 0x004D: 'れ', 0x004E: 'ろ', 0x004F: 'わ', 0x0050: 'を',
+    0x0051: 'ん',
+}
+
+# Katakana (0x0052-0x00A1)
+_GEN4_KATAKANA = {
+    0x0052: 'ァ', 0x0053: 'ア', 0x0054: 'ィ', 0x0055: 'イ', 0x0056: 'ゥ',
+    0x0057: 'ウ', 0x0058: 'ェ', 0x0059: 'エ', 0x005A: 'ォ', 0x005B: 'オ',
+    0x005C: 'カ', 0x005D: 'ガ', 0x005E: 'キ', 0x005F: 'ギ', 0x0060: 'ク',
+    0x0061: 'グ', 0x0062: 'ケ', 0x0063: 'ゲ', 0x0064: 'コ', 0x0065: 'ゴ',
+    0x0066: 'サ', 0x0067: 'ザ', 0x0068: 'シ', 0x0069: 'ジ', 0x006A: 'ス',
+    0x006B: 'ズ', 0x006C: 'セ', 0x006D: 'ゼ', 0x006E: 'ソ', 0x006F: 'ゾ',
+    0x0070: 'タ', 0x0071: 'ダ', 0x0072: 'チ', 0x0073: 'ヂ', 0x0074: 'ッ',
+    0x0075: 'ツ', 0x0076: 'ヅ', 0x0077: 'テ', 0x0078: 'デ', 0x0079: 'ト',
+    0x007A: 'ド', 0x007B: 'ナ', 0x007C: 'ニ', 0x007D: 'ヌ', 0x007E: 'ネ',
+    0x007F: 'ノ', 0x0080: 'ハ', 0x0081: 'バ', 0x0082: 'パ', 0x0083: 'ヒ',
+    0x0084: 'ビ', 0x0085: 'ピ', 0x0086: 'フ', 0x0087: 'ブ', 0x0088: 'プ',
+    0x0089: 'ヘ', 0x008A: 'ベ', 0x008B: 'ペ', 0x008C: 'ホ', 0x008D: 'ボ',
+    0x008E: 'ポ', 0x008F: 'マ', 0x0090: 'ミ', 0x0091: 'ム', 0x0092: 'メ',
+    0x0093: 'モ', 0x0094: 'ャ', 0x0095: 'ヤ', 0x0096: 'ュ', 0x0097: 'ユ',
+    0x0098: 'ョ', 0x0099: 'ヨ', 0x009A: 'ラ', 0x009B: 'リ', 0x009C: 'ル',
+    0x009D: 'レ', 0x009E: 'ロ', 0x009F: 'ワ', 0x00A0: 'ヲ', 0x00A1: 'ン',
+}
+
+# Fullwidth numbers and letters (0x00A2-0x00DF)
+_GEN4_FULLWIDTH = {
+    0x00A2: '０', 0x00A3: '１', 0x00A4: '２', 0x00A5: '３', 0x00A6: '４',
+    0x00A7: '５', 0x00A8: '６', 0x00A9: '７', 0x00AA: '８', 0x00AB: '９',
+    0x00AC: 'Ａ', 0x00AD: 'Ｂ', 0x00AE: 'Ｃ', 0x00AF: 'Ｄ', 0x00B0: 'Ｅ',
+    0x00B1: 'Ｆ', 0x00B2: 'Ｇ', 0x00B3: 'Ｈ', 0x00B4: 'Ｉ', 0x00B5: 'Ｊ',
+    0x00B6: 'Ｋ', 0x00B7: 'Ｌ', 0x00B8: 'Ｍ', 0x00B9: 'Ｎ', 0x00BA: 'Ｏ',
+    0x00BB: 'Ｐ', 0x00BC: 'Ｑ', 0x00BD: 'Ｒ', 0x00BE: 'Ｓ', 0x00BF: 'Ｔ',
+    0x00C0: 'Ｕ', 0x00C1: 'Ｖ', 0x00C2: 'Ｗ', 0x00C3: 'Ｘ', 0x00C4: 'Ｙ',
+    0x00C5: 'Ｚ', 0x00C6: 'ａ', 0x00C7: 'ｂ', 0x00C8: 'ｃ', 0x00C9: 'ｄ',
+    0x00CA: 'ｅ', 0x00CB: 'ｆ', 0x00CC: 'ｇ', 0x00CD: 'ｈ', 0x00CE: 'ｉ',
+    0x00CF: 'ｊ', 0x00D0: 'ｋ', 0x00D1: 'ｌ', 0x00D2: 'ｍ', 0x00D3: 'ｎ',
+    0x00D4: 'ｏ', 0x00D5: 'ｐ', 0x00D6: 'ｑ', 0x00D7: 'ｒ', 0x00D8: 'ｓ',
+    0x00D9: 'ｔ', 0x00DA: 'ｕ', 0x00DB: 'ｖ', 0x00DC: 'ｗ', 0x00DD: 'ｘ',
+    0x00DE: 'ｙ', 0x00DF: 'ｚ',
+}
+
+# Fullwidth symbols (0x00E0-0x011F)
+_GEN4_FULLWIDTH_SYMBOLS = {
+    0x00E1: '！', 0x00E2: '？', 0x00E3: '、', 0x00E4: '。', 0x00E5: '…',
+    0x00E6: '・', 0x00E7: '／', 0x00E8: '「', 0x00E9: '」', 0x00EA: '『',
+    0x00EB: '』', 0x00EC: '（', 0x00ED: '）', 0x00EE: '♂', 0x00EF: '♀',
+    0x00F0: '＋', 0x00F1: 'ー', 0x00F2: '×', 0x00F3: '÷', 0x00F4: '＝',
+    0x00F5: '～', 0x00F6: '：', 0x00F7: '；', 0x00F8: '．', 0x00F9: '，',
+    0x00FA: '♠', 0x00FB: '♣', 0x00FC: '♥', 0x00FD: '♦', 0x00FE: '★',
+    0x00FF: '◎', 0x0100: '○', 0x0101: '□', 0x0102: '△', 0x0103: '◇',
+    0x0104: '＠', 0x0105: '♪', 0x0106: '％', 0x0107: '☀', 0x0108: '☁',
+    0x0109: '☂', 0x010A: '☃', 0x0111: '円', 0x0118: '←', 0x0119: '↑',
+    0x011A: '↓', 0x011B: '→', 0x011C: '►', 0x011D: '＆',
+}
+
+# Halfwidth special characters (0x01AC-0x01FF)
+_GEN4_SPECIAL = {
+    # Punctuation and symbols (0x01AC-0x01BF)
+    0x01AC: '!', 0x01AD: '?', 0x01AE: ',', 0x01AF: '.',
+    0x01B0: '…', 0x01B1: '･', 0x01B2: '/', 0x01B3: ''',
+    0x01B4: ''', 0x01B5: '"', 0x01B6: '"', 0x01B7: '„',
+    0x01B8: '«', 0x01B9: '»', 0x01BA: '(', 0x01BB: ')',
+    0x01BC: '♂', 0x01BD: '♀', 0x01BE: '+', 0x01BF: '-',
+    # More symbols (0x01C0-0x01DF)
+    0x01C0: '*', 0x01C1: '#', 0x01C2: '=', 0x01C3: '&',
+    0x01C4: '~', 0x01C5: ':', 0x01C6: ';', 0x01C7: '♠',
+    0x01C8: '♣', 0x01C9: '♥', 0x01CA: '♦', 0x01CB: '★',
+    0x01CC: '◎', 0x01CD: '○', 0x01CE: '□', 0x01CF: '△',
+    0x01D0: '◇', 0x01D1: '@', 0x01D2: '♪', 0x01D3: '%',
+    0x01D4: '☀', 0x01D5: '☁', 0x01D6: '☂', 0x01D7: '☃',
+    0x01DE: ' ', 0x01DF: 'e',  # Space and lowercase e
+    # Extended characters (0x01E0-0x01FF)
+    0x01E0: 'PK', 0x01E1: 'MN', 0x01E4: '°', 0x01E5: '_',
+    0x01E6: '＿', 0x01E7: '․', 0x01E8: '‥',
+}
+
+def _get_gen4_char(c: int) -> str:
+    """Get Gen IV character by code point."""
+    if c == 0x0000:
+        return ' '
+    elif c in _GEN4_HIRAGANA:
+        return _GEN4_HIRAGANA[c]
+    elif c in _GEN4_KATAKANA:
+        return _GEN4_KATAKANA[c]
+    elif c in _GEN4_FULLWIDTH:
+        return _GEN4_FULLWIDTH[c]
+    elif c in _GEN4_FULLWIDTH_SYMBOLS:
+        return _GEN4_FULLWIDTH_SYMBOLS[c]
+    elif 0x0121 <= c <= 0x012A:
+        return chr(ord('0') + c - 0x0121)
+    elif 0x012B <= c <= 0x0144:
+        return chr(ord('A') + c - 0x012B)
+    elif 0x0145 <= c <= 0x015E:
+        return chr(ord('a') + c - 0x0145)
+    elif 0x015F <= c <= 0x019E:
+        ACCENTED = "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖרÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ"
+        idx = c - 0x015F
+        return ACCENTED[idx] if idx < len(ACCENTED) else '?'
+    elif 0x019F <= c <= 0x01AB:
+        # Extended Latin: Œ œ Ş ş ª º er re r ¡ ¿
+        extended = ['Œ', 'œ', 'Ş', 'ş', 'ª', 'º', 'er', 're', 'r', '', '¡', '¿', '!']
+        idx = c - 0x019F
+        return extended[idx] if idx < len(extended) else '?'
+    elif c in _GEN4_SPECIAL:
+        return _GEN4_SPECIAL[c]
+    elif c == 0xFFFE or c == 0xE000:
+        return '\n'
+    elif c == 0xFFFF or c == 0x01FF:
+        return ''
+    else:
+        return '?'
+
+
 def decode_gen4_text(data: bytes) -> list:
     """Decode Gen IV (DPPt/HGSS) text file.
     Format: u16 num_entries, u16 seed, encrypted entry table, encrypted strings.
     Entry table XOR: rolling key from seed * 0x2FD, advancing +0x493D per u16.
     String XOR: key = 0x91BD3 * (entry + 1) & 0xFFFF, advancing +0x493D per u16.
+    Supports 0xF100 compressed text (9-bit encoding, same as Gen V).
     """
     if len(data) < 4:
         return []
@@ -809,58 +960,135 @@ def decode_gen4_text(data: bytes) -> list:
     if table_end > len(data):
         return []
 
-    # Decrypt entry table (each u16 XOR'd with rolling key)
-    key = (seed * 0x2FD) & 0xFFFF
+    # Decrypt entry table (4 u16s per entry, all XOR'd with same per-entry key)
+    base_key = (seed * 0x2FD) & 0xFFFF
     entry_data = bytearray(data[4:table_end])
-    for i in range(0, len(entry_data), 2):
-        if i + 1 < len(entry_data):
-            val = entry_data[i] | (entry_data[i + 1] << 8)
-            val ^= key
-            entry_data[i] = val & 0xFF
-            entry_data[i + 1] = (val >> 8) & 0xFF
-            key = (key + 0x493D) & 0xFFFF
-
     entries = []
     for i in range(num_entries):
-        offset = struct.unpack_from('<I', entry_data, i * 8)[0]
-        length = struct.unpack_from('<I', entry_data, i * 8 + 4)[0]
-        entries.append((offset & 0xFFFF, length & 0xFFFF))
+        key2 = (base_key * (i + 1)) & 0xFFFF
+        off = i * 8
+        offset = struct.unpack_from('<H', entry_data, off)[0] ^ key2
+        charcount = struct.unpack_from('<H', entry_data, off + 4)[0] ^ key2
+        entries.append((offset, charcount))
 
     strings = []
     for i, (offset, length) in enumerate(entries):
-        str_start = table_end + offset
-        if length == 0 or str_start + length * 2 > len(data):
+        if length == 0 or offset + length * 2 > len(data):
             strings.append("")
             continue
 
         # Per-string decryption key
         key = ((i + 1) * 0x91BD3) & 0xFFFF
-        chars = []
+        vals = []
         for j in range(length):
-            pos = str_start + j * 2
+            pos = offset + j * 2
             if pos + 2 > len(data):
                 break
             enc = struct.unpack_from('<H', data, pos)[0]
             dec = (enc ^ key) & 0xFFFF
             key = (key + 0x493D) & 0xFFFF
+            vals.append(dec)
 
+        # Check for 0xF100 compressed text (9-bit encoding)
+        if vals and vals[0] == 0xF100:
+            bits = 0
+            nbits = 0
+            for w in vals[1:]:
+                if w == 0xFFFF:
+                    break
+                bits |= (w << nbits)
+                nbits += 16
+            chars = []
+            while nbits >= 9:
+                c = bits & 0x1FF
+                bits >>= 9
+                nbits -= 9
+                if c == 0x1FF:
+                    break
+                ch = _get_gen4_char(c)
+                if ch == '?':
+                    chars.append(f'\\x{c:04X}')
+                else:
+                    chars.append(ch)
+            strings.append(''.join(chars))
+            continue
+
+        # Normal text: process decrypted values
+        chars = []
+        for dec in vals:
             if dec == 0xFFFF:
                 break
             elif dec == 0xFFFE:
                 chars.append('\n')
-            elif dec in _GEN5_CHARMAP:
-                chars.append(_GEN5_CHARMAP[dec])
-            elif 0x0020 <= dec < 0xFFFE:
-                try:
-                    chars.append(chr(dec))
-                except (ValueError, OverflowError):
-                    chars.append(f'\\x{dec:04X}')
+            elif 0x0121 <= dec <= 0x012A:
+                chars.append(chr(ord('0') + dec - 0x0121))
+            elif 0x012B <= dec <= 0x0144:
+                chars.append(chr(ord('A') + dec - 0x012B))
+            elif 0x0145 <= dec <= 0x015E:
+                chars.append(chr(ord('a') + dec - 0x0145))
+            elif 0x015F <= dec <= 0x019E:
+                ACCENTED = "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖרÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ"
+                idx = dec - 0x015F
+                chars.append(ACCENTED[idx] if idx < len(ACCENTED) else f'\\x{dec:04X}')
+            elif dec in _GEN4_SPECIAL:
+                chars.append(_GEN4_SPECIAL[dec])
+            elif dec == 0x0000 or dec == 0xE000:
+                chars.append('\n' if dec == 0xE000 else ' ')
             else:
                 chars.append(f'\\x{dec:04X}')
 
         strings.append(''.join(chars))
 
     return strings
+
+# AI Flags for Gen IV/V trainers
+AI_FLAGS_GEN5 = {
+    0x001: "Basic AI",
+    0x002: "Check bad moves",
+    0x004: "Try to faint",
+    0x008: "Check viability",
+    0x010: "Setup first turn",
+    0x020: "Risky",
+    0x040: "Prefer strongest",
+    0x080: "Prefer status",
+    0x100: "Risky (advanced)",
+    0x200: "Weather",
+    0x400: "Trapping",
+    0x800: "Expert",
+    0x1000: "Double battle",
+    0x2000: "HP aware",
+    0x4000: "Unknown (0x4000)",
+    0x8000: "Roaming",
+}
+
+AI_FLAGS_GEN4 = {
+    0x001: "Basic AI",
+    0x002: "Check bad moves",
+    0x004: "Try to faint",
+    0x008: "Check viability",
+    0x010: "Setup first turn",
+    0x020: "Risky",
+    0x040: "Prefer strongest",
+    0x080: "Prefer status",
+    0x100: "Weather",
+    0x200: "Trapping",
+    0x400: "Unknown (0x400)",
+    0x800: "Unknown (0x800)",
+    0x1000: "Unknown (0x1000)",
+    0x2000: "Unknown (0x2000)",
+    0x4000: "Unknown (0x4000)",
+    0x8000: "Unknown (0x8000)",
+}
+
+def decode_ai_flags(flags: int, gen: int = 5) -> list:
+    """Decode AI flags into human-readable list."""
+    flag_map = AI_FLAGS_GEN5 if gen >= 5 else AI_FLAGS_GEN4
+    active_flags = []
+    for bit, name in sorted(flag_map.items()):
+        if flags & bit:
+            active_flags.append(name)
+    return active_flags if active_flags else ["None"]
+
 
 # TRPoke template sizes (keyed by template bits from TRData byte 0)
 # bit 0 = has custom moves, bit 1 = has held item
@@ -965,7 +1193,7 @@ def bootstrap_text_tables(rom, game_code: str) -> dict:
         result["mult"] = f"0x{text_mult:04X}"
 
     species = text_tables.get('species', [])
-    if len(species) > 1 and species[1] == "Bulbasaur":
+    if len(species) > 1 and species[1].strip().upper() == "BULBASAUR":
         result["status"] = "ok"
         result["sample"] = {"species[1]": species[1], "species[26]": species[26] if len(species) > 26 else "?"}
     else:
@@ -989,10 +1217,75 @@ def decode_trainer_iv(byte_val):
     """TRPoke difficulty byte → IV for all stats. 255 → 31, 0 → 0."""
     return byte_val * 31 // 255
 
+def get_ability_from_personal(species_id: int, ability_slot: int) -> str:
+    """Get actual ability name from personal data based on species and slot."""
+    if not current_rom or current_rom['type'] != 'nds':
+        return f"ability_slot_{ability_slot}"
+    
+    try:
+        rom = current_rom['rom']
+        game_code = current_rom['header']['game_code']
+        game_info = GAME_INFO.get(game_code, {})
+        personal_path = game_info.get('narcs', {}).get('personal')
+        
+        if not personal_path:
+            return f"ability_slot_{ability_slot}"
+        
+        personal_narc_data = rom.getFileByName(personal_path)
+        personal_narc = ndspy.narc.NARC(personal_narc_data)
+        
+        if species_id >= len(personal_narc.files):
+            return f"ability_slot_{ability_slot}"
+        
+        personal_data = personal_narc.files[species_id]
+        gen = text_gen or 5
+        ability_list = text_tables.get('abilities', [])
+        
+        if gen <= 4:
+            # Gen IV: abilities at bytes 0x16, 0x17 (u8)
+            if len(personal_data) < 0x18:
+                return f"ability_slot_{ability_slot}"
+            abilities = [personal_data[0x16], personal_data[0x17]]
+            if ability_slot < len(abilities):
+                aid = abilities[ability_slot]
+                return ability_list[aid] if aid < len(ability_list) else f"ability#{aid}"
+        else:
+            # Gen V: abilities at 0x18, 0x1A, 0x1C (u16, slot 0/1/2 = normal/normal/hidden)
+            if len(personal_data) < 0x1E:
+                return f"ability_slot_{ability_slot}"
+            abilities = []
+            for i in range(3):
+                off = 0x18 + i * 2
+                if off + 2 <= len(personal_data):
+                    aid = struct.unpack_from('<H', personal_data, off)[0]
+                    abilities.append(aid)
+            if ability_slot < len(abilities):
+                aid = abilities[ability_slot]
+                return ability_list[aid] if aid < len(ability_list) else f"ability#{aid}"
+        
+        return f"ability_slot_{ability_slot}"
+    except:
+        return f"ability_slot_{ability_slot}"
+
+
+def decode_gender(gender_byte: int, species_id: int) -> str:
+    """Decode gender byte. 0=default (use species ratio), 1=male, 2=female, 3=genderless."""
+    if gender_byte == 1:
+        return "Male"
+    elif gender_byte == 2:
+        return "Female"
+    elif gender_byte == 3:
+        return "Genderless"
+    else:
+        # Gender 0 means use species gender ratio - check if species is genderless
+        # For now, return "Random" - could enhance to check personal data gender ratio
+        return "Random"
+
+
 def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
     """Decode a TRPoke file into human-readable format using text_tables."""
     if len(data) == 0:
-        return {"pokemon": [], "raw": data.hex()}
+        return {"pokemon": []}
 
     # Determine template from TRData byte 0 if available
     template = 0
@@ -1012,8 +1305,6 @@ def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
     moves_list = text_tables.get('moves', [])
     items_list = text_tables.get('items', [])
 
-    GENDER_OVERRIDE = {0: "default", 1: "male", 2: "female"}
-
     pokemon = []
     for i in range(num_pokemon):
         off = i * pokemon_size
@@ -1026,16 +1317,26 @@ def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
         species_id = struct.unpack_from('<H', data, off + 4)[0]
         form = struct.unpack_from('<H', data, off + 6)[0]
 
-        ability_slot = ability_gender >> 4
-        gender = GENDER_OVERRIDE.get(ability_gender & 0xF, f"unknown ({ability_gender & 0xF})")
+        ability_slot = (ability_gender >> 4) & 0xF
+        gender_byte = ability_gender & 0xF
         species_name = species_list[species_id] if species_id < len(species_list) else f"#{species_id}"
+        
+        # Get actual ability name
+        ability_name = get_ability_from_personal(species_id, ability_slot)
+        
+        # Decode gender
+        gender = decode_gender(gender_byte, species_id)
+        
+        # Decode IVs
+        ivs = decode_trainer_iv(difficulty)
 
         entry = {
-            "species": species_name, "species_id": species_id,
+            "species": species_name,
+            "species_id": species_id,
             "level": level,
-            "ivs": decode_trainer_iv(difficulty),
-            "ability_slot": ability_slot,
+            "ability": ability_name,
             "gender": gender,
+            "ivs": ivs,
             "form": form,
         }
 
@@ -1046,10 +1347,12 @@ def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
 
         if template & 1:  # Has moves
             move_off = off + 8 + (2 if template & 2 else 0)
+            moves = []
             for m in range(4):
                 mid = struct.unpack_from('<H', data, move_off + m * 2)[0]
                 mname = moves_list[mid] if mid < len(moves_list) else f"move#{mid}"
-                entry[f"move_{m+1}"] = mname if mid > 0 else "---"
+                moves.append(mname if mid > 0 else "---")
+            entry["moves"] = moves
 
         pokemon.append(entry)
 
@@ -1059,11 +1362,12 @@ def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
 def decode_trdata(data: bytes, index: int = None) -> dict:
     """Decode a TRData entry into human-readable format."""
     if len(data) < 20:
-        return {"raw": data.hex()}
+        return None
     
     trainer_names = text_tables.get('trainer_names', [])
     trainer_classes = text_tables.get('trainer_classes', [])
     items_list = text_tables.get('items', [])
+    gen = text_gen or 5
 
     BATTLE_TYPES = {0: "Single", 1: "Double", 2: "Triple", 3: "Rotation"}
 
@@ -1081,7 +1385,8 @@ def decode_trdata(data: bytes, index: int = None) -> dict:
             item_name = items_list[item_id] if item_id < len(items_list) else f"item#{item_id}"
             battle_items.append(item_name)
 
-    ai_flags = struct.unpack_from('<I', data, 12)[0]
+    ai_flags_raw = struct.unpack_from('<I', data, 12)[0]
+    ai_flags = decode_ai_flags(ai_flags_raw, gen)
     prize_money_base = data[17]
     area_id = data[18]
     class_name = trainer_classes[trainer_class] if trainer_class < len(trainer_classes) else f"class#{trainer_class}"
@@ -1092,7 +1397,7 @@ def decode_trdata(data: bytes, index: int = None) -> dict:
         "num_pokemon": num_pokemon,
         "has_custom_moves": has_moves,
         "has_held_items": has_items,
-        "ai_flags": f"0x{ai_flags:08X}",
+        "ai_flags": ai_flags,
         "battle_items": battle_items if battle_items else "None",
         "reward_multiplier": prize_money_base,
         "area_id": area_id,
@@ -1144,7 +1449,6 @@ def decode_pwt(data: bytes, is_champions: bool = False) -> dict:
         "moves": move_names,
         "evs": decode_ev_spread(ev_spread),
         "nature": nature_name,
-        "raw": data.hex(),
     }
 
     if is_champions:
@@ -1263,6 +1567,7 @@ def decode_personal(data: bytes, file_idx: int = 0) -> dict:
         "base_happiness": base_happiness,
         "exp_growth": exp_growth,
         "egg_groups": [egg1, egg2],
+        "raw": data.hex(),
     }
     if result["types"][0] == result["types"][1]:
         result["types"] = [result["types"][0]]
@@ -1408,46 +1713,333 @@ def decode_move_data(data: bytes, file_idx: int = 0) -> dict:
 
 
 def decode_encounters(data: bytes) -> dict:
-    """Decode Gen V wild encounter data using text_tables."""
+    """Decode wild encounter data. Routes to gen-specific decoder by size/gen."""
+    gen = text_gen or 5
+
+    if gen == 5:
+        return _decode_encounters_gen5(data)
+    elif gen == 4:
+        if len(data) == 196:
+            return _decode_encounters_hgss(data)
+        elif len(data) == 424:
+            return _decode_encounters_dpp(data)
+
+    return None
+
+
+def _decode_encounters_gen5(data: bytes) -> dict:
+    """Decode Gen V encounter data (BW/B2W2).
+    232 bytes per season. Species u16 encodes form in upper bits (& 0x7FF)."""
     if len(data) < 232:
         return None
-    
-    # Encounter rates
-    rates = {
-        "grass": data[0], "double_grass": data[1], "special_grass": data[2],
-        "surf": data[3], "special_surf": data[4],
-        "fishing": data[5], "special_fishing": data[6]
-    }
-    
-    def read_entries(offset, count):
-        entries = []
-        for j in range(count):
-            pos = offset + j * 4
-            if pos + 4 > len(data):
-                break
-            species_id = struct.unpack_from("<H", data, pos)[0]
-            min_lv = data[pos + 2]
-            max_lv = data[pos + 3]
+
+    seasons = []
+    season_names = ['Spring', 'Summer', 'Fall', 'Winter']
+    num_seasons = len(data) // 232
+
+    for season_idx in range(num_seasons):
+        season_data = data[season_idx * 232:(season_idx + 1) * 232]
+
+        rates = {
+            "grass": season_data[0], "double_grass": season_data[1], "special_grass": season_data[2],
+            "surf": season_data[3], "special_surf": season_data[4],
+            "fishing": season_data[5], "special_fishing": season_data[6]
+        }
+
+        def read_entries(offset, count):
+            entries = []
+            for j in range(count):
+                pos = offset + j * 4
+                if pos + 4 > len(season_data):
+                    break
+                raw = struct.unpack_from("<H", season_data, pos)[0]
+                species_id = raw & 0x7FF
+                form = raw >> 11
+                min_lv = season_data[pos + 2]
+                max_lv = season_data[pos + 3]
+                if species_id == 0:
+                    continue
+                name = get_text("species", species_id)
+                if form > 0:
+                    name += f" (form {form})"
+                entries.append({"species": name, "level": f"{min_lv}-{max_lv}" if min_lv != max_lv else str(min_lv)})
+            return entries
+
+        result = {"rates": {k: v for k, v in rates.items() if v > 0}}
+
+        groups = [
+            ("grass", 8, 12), ("double_grass", 56, 12), ("special_grass", 104, 12),
+            ("surf", 152, 5), ("special_surf", 172, 5),
+            ("fishing", 192, 5), ("special_fishing", 212, 5)
+        ]
+        for name, offset, count in groups:
+            if rates.get(name, 0) > 0:
+                entries = read_entries(offset, count)
+                if entries:
+                    result[name] = entries
+
+        if num_seasons > 1:
+            result["season"] = season_names[season_idx] if season_idx < len(season_names) else f"Season {season_idx + 1}"
+            seasons.append(result)
+        else:
+            return result
+
+    return {"seasons": seasons} if seasons else None
+
+
+def _decode_encounters_dpp(data: bytes) -> dict:
+    """Decode Gen IV DP/Pt encounter data (424 bytes).
+    Land: rate(u32) + 12 grass slots(u32 level + u32 species) + replacements.
+    Water: 5 sections × (rate u32 + 5 × {max_lv u8, min_lv u8, pad u16, species u16, pad u16})."""
+    if len(data) != 424:
+        return None
+
+    result = {}
+
+    # Grass rate at offset 0, slots at offset 4
+    grass_rate = struct.unpack_from("<I", data, 0)[0]
+    if grass_rate > 0:
+        grass = []
+        for i in range(12):
+            pos = 4 + i * 8
+            level = struct.unpack_from("<I", data, pos)[0]
+            species_id = struct.unpack_from("<I", data, pos + 4)[0]
             if species_id == 0:
                 continue
-            name = get_text("species", species_id)
-            entries.append({"species_id": species_id, "species": name, "level": f"{min_lv}-{max_lv}"})
-        return entries
-    
-    result = {"rates": {k: v for k, v in rates.items() if v > 0}}
-    
-    groups = [
-        ("grass", 8, 12), ("double_grass", 56, 12), ("special_grass", 104, 12),
-        ("surf", 152, 5), ("special_surf", 172, 5),
-        ("fishing", 192, 5), ("special_fishing", 212, 5)
-    ]
-    for name, offset, count in groups:
-        if rates.get(name, 0) > 0 or name in ("grass", "surf", "fishing"):
-            entries = read_entries(offset, count)
+            grass.append({"species": get_text("species", species_id), "level": level})
+        if grass:
+            result["grass"] = grass
+            result["grass_rate"] = grass_rate
+
+    # Replacement species (offset 100): swarm(2), day(2), night(2), radar(4)
+    def read_replacements(offset, count):
+        species = []
+        for i in range(count):
+            sid = struct.unpack_from("<I", data, offset + i * 4)[0]
+            if sid > 0:
+                species.append(get_text("species", sid))
+        return species
+
+    swarm = read_replacements(100, 2)
+    if swarm:
+        result["swarm"] = swarm
+    day = read_replacements(108, 2)
+    if day:
+        result["day_replacements"] = day
+    night = read_replacements(116, 2)
+    if night:
+        result["night_replacements"] = night
+    radar = read_replacements(124, 4)
+    if radar:
+        result["radar"] = radar
+
+    # Water sections start at offset 204 (0xCC)
+    # 5 sections: surf, surf_special(?), old_rod, good_rod, super_rod
+    water_names = ["surf", "surf_special", "old_rod", "good_rod", "super_rod"]
+    water_offset = 204
+    for section_name in water_names:
+        rate = struct.unpack_from("<I", data, water_offset)[0]
+        water_offset += 4
+        if rate > 0:
+            entries = []
+            for i in range(5):
+                pos = water_offset + i * 8
+                max_lv = data[pos]
+                min_lv = data[pos + 1]
+                species_id = struct.unpack_from("<H", data, pos + 4)[0]
+                if species_id == 0:
+                    continue
+                name = get_text("species", species_id)
+                lvl = f"{min_lv}-{max_lv}" if min_lv != max_lv else str(min_lv)
+                entries.append({"species": name, "level": lvl})
             if entries:
-                result[name] = entries
+                result[section_name] = entries
+        water_offset += 40  # 5 slots × 8 bytes
+
+    return result if result else None
+
+
+def _decode_encounters_hgss(data: bytes) -> dict:
+    """Decode Gen IV HGSS encounter data (196 bytes).
+    Header: 8 × u8 rates. Grass: 12 levels + 3×12 species (morn/day/night) + 4 sound species.
+    Water: surf(5) + rocksmash(2) + oldrod(5) + goodrod(5) + superrod(5), each 4B/slot."""
+    if len(data) != 196:
+        return None
+
+    # Header rates (u8 each)
+    grass_rate = data[0]
+    surf_rate = data[1]
+    rock_smash_rate = data[2]
+    old_rod_rate = data[3]
+    good_rod_rate = data[4]
+    super_rod_rate = data[5]
+
+    result = {}
+
+    # Grass: 12 levels at offset 8, then 3 species tables (morning/day/night)
+    if grass_rate > 0:
+        levels = [data[8 + i] for i in range(12)]
+        tables = {}
+        for t_idx, t_name in enumerate(["morning", "day", "night"]):
+            base = 20 + t_idx * 24  # 12 species × 2 bytes = 24
+            species = []
+            for i in range(12):
+                sid = struct.unpack_from("<H", data, base + i * 2)[0]
+                if sid == 0:
+                    continue
+                species.append({"species": get_text("species", sid), "level": levels[i]})
+            if species:
+                tables[t_name] = species
+        if tables:
+            result["grass"] = tables
+            result["grass_rate"] = grass_rate
+
+    # Sound species at offset 92 (Hoenn Sound × 2, Sinnoh Sound × 2)
+    sound_species = []
+    for i in range(4):
+        sid = struct.unpack_from("<H", data, 92 + i * 2)[0]
+        if sid > 0:
+            sound_species.append(get_text("species", sid))
+    if sound_species:
+        result["sound"] = {"hoenn": sound_species[:2], "sinnoh": sound_species[2:]}
+
+    # Water helper: each slot is min_lv u8, max_lv u8, species u16 (4 bytes)
+    def read_water(offset, count):
+        entries = []
+        for i in range(count):
+            pos = offset + i * 4
+            min_lv = data[pos]
+            max_lv = data[pos + 1]
+            species_id = struct.unpack_from("<H", data, pos + 2)[0]
+            if species_id == 0:
+                continue
+            lvl = f"{min_lv}-{max_lv}" if min_lv != max_lv else str(min_lv)
+            entries.append({"species": get_text("species", species_id), "level": lvl})
+        return entries
+
+    if surf_rate > 0:
+        surf = read_water(100, 5)
+        if surf:
+            result["surf"] = surf
+
+    if rock_smash_rate > 0:
+        rocks = read_water(120, 2)
+        if rocks:
+            result["rock_smash"] = rocks
+
+    if old_rod_rate > 0:
+        old = read_water(128, 5)
+        if old:
+            result["old_rod"] = old
+
+    if good_rod_rate > 0:
+        good = read_water(148, 5)
+        if good:
+            result["good_rod"] = good
+
+    if super_rod_rate > 0:
+        sup = read_water(168, 5)
+        if sup:
+            result["super_rod"] = sup
+
+    return result if result else None
+
+
+def decode_contest(data: bytes, file_idx: int = 0) -> dict:
+    """Decode Gen IV Contest data (Diamond/Pearl/Platinum).
+    File 0: Contest pokemon data (96 bytes per entry, 80 entries)
+    Format per entry:
+    - Offset 0-3: Unknown (u32)
+    - Offset 4-5: Species ID (u16)
+    - Offset 6-7: Unknown (u16)
+    - Offset 8-11: Unknown (u32)
+    - Offset 12+: Move IDs and other data
+    """
+    if file_idx != 0 or len(data) < 96:
+        return {"raw": data.hex()}
     
-    return result
+    species_list = text_tables.get('species', [])
+    moves_list = text_tables.get('moves', [])
+    
+    # Parse 96-byte entries
+    num_entries = len(data) // 96
+    entries = []
+    
+    for i in range(num_entries):
+        offset = i * 96
+        entry_data = data[offset:offset + 96]
+        
+        # Parse species at offset 8-9 (based on hex analysis)
+        species_id = struct.unpack_from('<H', entry_data, 8)[0]
+        if species_id == 0 or species_id >= len(species_list):
+            continue
+            
+        species_name = species_list[species_id]
+        
+        # Parse moves (appears to be at offsets 12-19, 4 moves × 2 bytes)
+        moves = []
+        for m in range(4):
+            move_id = struct.unpack_from('<H', entry_data, 12 + m * 2)[0]
+            if move_id > 0 and move_id < len(moves_list):
+                moves.append(moves_list[move_id])
+        
+        entry = {
+            "species": species_name,
+            "species_id": species_id,
+        }
+        
+        if moves:
+            entry["moves"] = moves
+        
+        entries.append(entry)
+    
+    return {
+        "facility": "Contest Hall",
+        "count": len(entries),
+        "pokemon": entries
+    } if entries else {"raw": data.hex()}
+
+
+POKEATHLON_STATS = ['Speed', 'Power', 'Skill', 'Stamina', 'Jump']
+
+def decode_pokeathlon_performance(data: bytes, file_idx: int = 0) -> dict:
+    """Decode Pokéathlon performance stats (HGSS only).
+    Cracked format: bytes 0-4 = base per stat, min/max pairs at (5,10),(11,12),(13,14),(15,16),(17,18).
+    Internal 0-4 maps to 1-5 stars.
+    """
+    if len(data) != 20:
+        return None
+
+    species_list = text_tables.get('species', [])
+    species_name = species_list[file_idx] if file_idx < len(species_list) else f"#{file_idx}"
+
+    minmax = [(5, 10), (11, 12), (13, 14), (15, 16), (17, 18)]
+    stats = {}
+    for i, stat_name in enumerate(POKEATHLON_STATS):
+        mn = data[minmax[i][0]] + 1
+        mx = data[minmax[i][1]] + 1
+        if mn == mx:
+            stats[stat_name] = f"{mn}*"
+        else:
+            stats[stat_name] = f"{mn}/{mx}*"
+
+    return {
+        "species": species_name,
+        "species_id": file_idx,
+        "facility": "Pokéathlon",
+        "stats": stats
+    }
+
+
+def _format_hex(data: bytes, base_offset: int = 0) -> str:
+    """Format bytes as readable hex dump: offset | hex | ascii."""
+    lines = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hex_part = ' '.join(f'{b:02X}' for b in chunk)
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        lines.append(f"{base_offset + i:08X}  {hex_part:<48}  {ascii_part}")
+    return '\n'.join(lines)
 
 
 def _auto_decode(path: str, data: bytes):
@@ -1537,7 +2129,7 @@ def _auto_decode(path: str, data: bytes):
                 decoded['trainer_index'] = file_idx
                 return decoded
         elif role == 'battle_tower_pokemon':
-            decoded = decode_pwt(data, False)
+            decoded = decode_pwt(data, True)  # Gen IV: field12 = held_item
             if decoded:
                 decoded['facility'] = 'Battle Tower'
                 decoded['pool_index'] = file_idx
@@ -1548,6 +2140,10 @@ def _auto_decode(path: str, data: bytes):
                 decoded['facility'] = 'Battle Tower'
                 decoded['trainer_index'] = file_idx
                 return decoded
+        elif role == 'pokeathlon_performance':
+            return decode_pokeathlon_performance(data, file_idx)
+        elif role == 'contest':
+            return decode_contest(data, file_idx)
     except Exception:
         pass
 
@@ -1556,7 +2152,7 @@ def _auto_decode(path: str, data: bytes):
 
 # ============ Tool Handlers ============
 
-async def open_rom(path: str) -> dict:
+async def spotlight(path: str) -> dict:
     """Open a ROM file for exploration. Multiple ROMs can be open simultaneously."""
     global current_rom, current_flipnote
 
@@ -1658,7 +2254,7 @@ async def open_rom(path: str) -> dict:
     return result
 
 
-async def close_rom(save: bool = False) -> dict:
+async def return_tool(save: bool = False) -> dict:
     """Close the active ROM (or all with save=False). Switches to another loaded ROM if available."""
     if not current_rom:
         return {"error": "No ROM currently open"}
@@ -1667,7 +2263,7 @@ async def close_rom(save: bool = False) -> dict:
 
     if save and current_rom['type'] == 'nds':
         try:
-            result = await save_rom(current_rom['path'])
+            result = await record(current_rom['path'])
             if 'error' in result:
                 return result
         except Exception as e:
@@ -1692,7 +2288,7 @@ async def close_rom(save: bool = False) -> dict:
     return result
 
 
-async def ls(path: str = "/", expand_narcs: bool = False) -> dict:
+async def summarize(path: str = "/", expand_narcs: bool = False) -> dict:
     """List contents at a path. Pass a NARC path to see its contents."""
     if not current_rom:
         return {"error": "No ROM currently open"}
@@ -1768,7 +2364,7 @@ async def ls(path: str = "/", expand_narcs: bool = False) -> dict:
     return {"path": path, "contents": contents}
 
 
-async def read(path: str, offset: int = 0, length: int = None, decompress: bool = True) -> dict:
+async def decipher(path: str, offset: int = 0, length: int = None, decompress: bool = True) -> dict:
     """Read file contents or bytes."""
     # Multi-file: comma-separated paths
     if "," in path:
@@ -1776,7 +2372,7 @@ async def read(path: str, offset: int = 0, length: int = None, decompress: bool 
         for p in path.split(","):
             p = p.strip()
             if p:
-                results.append(await read(p, offset, length, decompress))
+                results.append(await decipher(p, offset, length, decompress))
         return {"multi": True, "results": results}
 
     if not current_rom:
@@ -1818,7 +2414,8 @@ async def read(path: str, offset: int = 0, length: int = None, decompress: bool 
             elif offset:
                 data = data[offset:]
 
-            return {"path": path, "size": len(data), "compression": compression, "data": data.hex(), "decoded": _auto_decode(path, data)}
+            result = {"path": path, "size": len(data), "compression": compression, "hex": _format_hex(data, offset), "decoded": _auto_decode(path, data)}
+            return result
 
         except Exception as e:
             return {"error": str(e)}
@@ -1827,10 +2424,10 @@ async def read(path: str, offset: int = 0, length: int = None, decompress: bool 
         with open(current_rom['path'], 'rb') as f:
             f.seek(offset)
             data = f.read(length) if length else f.read()
-        return {"offset": offset, "size": len(data), "data": data.hex()}
+        return {"offset": offset, "size": len(data), "hex": _format_hex(data, offset)}
 
 
-async def write(path: str, data: str, offset: int = 0, encoding: str = "hex") -> dict:
+async def sketch(path: str, data: str, offset: int = 0, encoding: str = "hex") -> dict:
     """Write data to a file."""
     if not current_rom:
         return {"error": "No ROM currently open"}
@@ -1887,7 +2484,7 @@ async def write(path: str, data: str, offset: int = 0, encoding: str = "hex") ->
         return {"written": len(data_bytes), "offset": offset}
 
 
-async def save_rom(output_path: str) -> dict:
+async def record(output_path: str) -> dict:
     """Repack and save the ROM."""
     if not current_rom:
         return {"error": "No ROM currently open"}
@@ -1917,7 +2514,7 @@ async def save_rom(output_path: str) -> dict:
     return {"saved": output_path}
 
 
-async def hexdump(path: str = None, offset: int = 0, length: int = 256, search: str = None) -> dict:
+async def scope(path: str = None, offset: int = 0, length: int = 256, search: str = None) -> dict:
     """Raw hex dump with optional search."""
     if not current_rom:
         return {"error": "No ROM currently open"}
@@ -1973,7 +2570,7 @@ async def hexdump(path: str = None, offset: int = 0, length: int = 256, search: 
 
 
 
-async def search(narc_path: str = None, hex: str = None, name: str = None, table: str = None, exact: bool = False) -> dict:
+async def dowse(narc_path: str = None, hex: str = None, name: str = None, table: str = None, exact: bool = False) -> dict:
     """Search NARC files by hex pattern, or look up text table entries by name.
     
     Modes:
@@ -2058,7 +2655,7 @@ async def search(narc_path: str = None, hex: str = None, name: str = None, table
     return {"error": "Provide either name (text lookup) or hex (hex search)"}
 
 
-async def diff(path_a: str, path_b: str) -> dict:
+async def judgement(path_a: str, path_b: str) -> dict:
     """Compare two files."""
     if not current_rom:
         return {"error": "No ROM currently open"}
@@ -2117,13 +2714,16 @@ async def diff(path_a: str, path_b: str) -> dict:
 
 async def stats() -> dict:
     """Show honest documentation coverage statistics."""
-    if not current_flipnote:
+    if not current_rom:
         return {"error": "No ROM currently open"}
-
+    
+    if not current_flipnote:
+        return {"error": "No flipnote loaded"}
+    
     fpn = current_flipnote['data']
     notes = fpn.get('notes', {})
-    tree = fpn.get('tree', [])
     rom_stats = fpn.get('rom_stats', {})
+    tree = fpn.get('tree', [])
 
     # Count files in tree (excluding folders)
     total_files = len([p for p in tree if not p.endswith('/')])
@@ -2235,20 +2835,24 @@ async def view_flipnote(game: str) -> dict:
 async def note(path: str, description: str, name: str = None, format: str = None,
                tags: list = None, file_range: str = None, examples: list = None, related: list = None) -> dict:
     """Add a note to the current Flipnote."""
-    if not current_flipnote:
+    if not current_rom:
         return {"error": "No ROM currently open"}
-
+    
+    if not current_flipnote:
+        return {"error": "No flipnote loaded"}
+    
     fpn_data = current_flipnote['data']
 
-    note_data = {"description": description}
-    if name: note_data["name"] = name
-    if format: note_data["format"] = format
-    if tags: note_data["tags"] = tags
-    if file_range: note_data["file_range"] = file_range
-    if examples: note_data["examples"] = examples
-    if related: note_data["related"] = related
+    if 'notes' not in fpn_data:
+        fpn_data['notes'] = {}
 
-    fpn_data['notes'][path] = note_data
+    fpn_data['notes'][path] = {"description": description}
+    if name: fpn_data['notes'][path]["name"] = name
+    if format: fpn_data['notes'][path]["format"] = format
+    if tags: fpn_data['notes'][path]["tags"] = tags
+    if file_range: fpn_data['notes'][path]["file_range"] = file_range
+    if examples: fpn_data['notes'][path]["examples"] = examples
+    if related: fpn_data['notes'][path]["related"] = related
 
     with open(current_flipnote['path'], 'w', encoding='utf-8') as f:
         json.dump(fpn_data, f, indent=2, ensure_ascii=False)
@@ -2258,10 +2862,13 @@ async def note(path: str, description: str, name: str = None, format: str = None
 
 async def edit_note(path: str, description: str = None, name: str = None, format: str = None,
                     tags: list = None, file_range: str = None, examples: list = None, related: list = None) -> dict:
-    """Edit an existing note."""
-    if not current_flipnote:
+    """Edit an existing note in the Flipnote."""
+    if not current_rom:
         return {"error": "No ROM currently open"}
-
+    
+    if not current_flipnote:
+        return {"error": "No flipnote loaded"}
+    
     fpn_data = current_flipnote['data']
 
     if path not in fpn_data['notes']:
@@ -2283,18 +2890,21 @@ async def edit_note(path: str, description: str = None, name: str = None, format
 
 async def delete_note(path: str) -> dict:
     """Delete a note from the Flipnote."""
-    if not current_flipnote:
+    if not current_rom:
         return {"error": "No ROM currently open"}
-
+    
+    if not current_flipnote:
+        return {"error": "No flipnote loaded"}
+    
     fpn_data = current_flipnote['data']
 
     if path not in fpn_data['notes']:
         return {"error": f"Note not found: {path}"}
-
+    
     del fpn_data['notes'][path]
 
-    with open(current_flipnote['path'], 'w') as f:
-        json.dump(fpn_data, f, indent=2)
+    with open(current_flipnote['path'], 'w', encoding='utf-8') as f:
+        json.dump(fpn_data, f, indent=2, ensure_ascii=False)
 
     return {"deleted": path}
 
@@ -2305,15 +2915,15 @@ async def delete_note(path: str) -> dict:
 async def call_tool(name: str, arguments: dict):
     """Route tool calls to handler functions."""
     handlers = {
-        "open_rom": open_rom,
-        "close_rom": close_rom,
-        "ls": ls,
-        "read": read,
-        "write": write,
-        "save_rom": save_rom,
-        "hexdump": hexdump,
-        "search": search,
-        "diff": diff,
+        "spotlight": spotlight,
+        "return": return_tool,
+        "summarize": summarize,
+        "decipher": decipher,
+        "sketch": sketch,
+        "record": record,
+        "scope": scope,
+        "dowse": dowse,
+        "judgement": judgement,
         "stats": stats,
         "list_flipnotes": list_flipnotes,
         "view_flipnote": view_flipnote,
@@ -2325,7 +2935,7 @@ async def call_tool(name: str, arguments: dict):
     handler = handlers.get(name)
     if not handler:
         raise ValueError(f"Unknown tool: {name}")
-
+    
     result = await handler(**arguments)
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
@@ -2333,23 +2943,23 @@ async def call_tool(name: str, arguments: dict):
 @server.list_tools()
 async def list_tools():
     return [
-        Tool(name="open_rom", description="Open a ROM file (.nds, .gba, .gbc, .gb) for exploration", inputSchema={
+        Tool(name="spotlight", description="Open a ROM file (.nds, .gba, .gbc, .gb) for exploration", inputSchema={
             "type": "object",
             "properties": {"path": {"type": "string", "description": "Path to ROM file"}},
             "required": ["path"]
         }),
-        Tool(name="close_rom", description="Close the current ROM", inputSchema={
+        Tool(name="return", description="Close the current ROM", inputSchema={
             "type": "object",
             "properties": {"save": {"type": "boolean", "description": "Save changes before closing"}}
         }),
-        Tool(name="ls", description="List contents at a path within the ROM. Pass a NARC file path to see its contents.", inputSchema={
+        Tool(name="summarize", description="List contents at a path within the ROM. Pass a NARC file path to see its contents.", inputSchema={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to list (default: root). Can be a folder or NARC file path."},
                 "expand_narcs": {"type": "boolean", "description": "If true, show preview of NARC contents inline (default: false)"}
             }
         }),
-        Tool(name="read", description="Read file contents (auto-decompresses LZ10/LZ11)", inputSchema={
+        Tool(name="decipher", description="Read file contents (auto-decompresses LZ10/LZ11)", inputSchema={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path. Use 'arm9.bin' or 'arm7.bin' for ARM binaries. Use 'narc_path:index' for files inside NARCs. Comma-separated for multi-file (e.g. 'a/0/9/1:5,a/0/9/2:5')."},
@@ -2359,7 +2969,7 @@ async def list_tools():
             },
             "required": ["path"]
         }),
-        Tool(name="write", description="Write data to a file (supports text and hex with spaces)", inputSchema={
+        Tool(name="sketch", description="Write data to a file (supports text and hex with spaces)", inputSchema={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path"},
@@ -2369,12 +2979,12 @@ async def list_tools():
             },
             "required": ["path", "data"]
         }),
-        Tool(name="save_rom", description="Repack and save the ROM", inputSchema={
+        Tool(name="record", description="Repack and save the ROM", inputSchema={
             "type": "object",
             "properties": {"output_path": {"type": "string", "description": "Output path"}},
             "required": ["output_path"]
         }),
-        Tool(name="hexdump", description="Raw hex dump with optional search", inputSchema={
+        Tool(name="scope", description="Raw hex dump with optional search", inputSchema={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path (optional)"},
@@ -2383,7 +2993,7 @@ async def list_tools():
                 "search": {"type": "string", "description": "Hex pattern to search"}
             }
         }),
-        Tool(name="search", description="Search NARC files by hex pattern, or look up text table entries by name", inputSchema={
+        Tool(name="dowse", description="Search NARC files by hex pattern, or look up text table entries by name", inputSchema={
             "type": "object",
             "properties": {
                 "narc_path": {"type": "string", "description": "NARC path to search (for hex mode)"},
@@ -2393,7 +3003,7 @@ async def list_tools():
                 "exact": {"type": "boolean", "description": "Match whole string instead of substring (default: false)"}
             }
         }),
-        Tool(name="diff", description="Compare two files", inputSchema={
+        Tool(name="judgement", description="Compare two files", inputSchema={
             "type": "object",
             "properties": {
                 "path_a": {"type": "string", "description": "First file"},
