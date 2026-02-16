@@ -630,6 +630,7 @@ _GEN5_B2W2 = {
     'learnsets': 'a/0/1/8',
     'evolutions': 'a/0/1/9',
     'move_data': 'a/0/2/1',
+    'items': 'a/0/2/4',
 }
 _GEN5_BW1 = {
     'text': 'a/0/0/2',
@@ -639,6 +640,7 @@ _GEN5_BW1 = {
     'learnsets': 'a/0/1/8',
     'evolutions': 'a/0/1/9',
     'move_data': 'a/0/2/1',
+    'items': 'a/0/2/4',
 }
 _BW1_ENCOUNTERS = {
     'encounters': 'a/1/2/6',  # 112 files, 232 bytes each
@@ -693,9 +695,10 @@ _GEN4_HGSS = {
     'move_data': 'a/0/1/1',
     'trdata': 'a/0/5/5',
     'trpoke': 'a/0/5/6',
-    'encounters': 'a/0/3/7',  # 142 files, 196 bytes each
+    'encounters': 'a/1/3/6',  # 142 files, 196 bytes each
     'battle_tower_pokemon': 'a/2/0/3',   # Real Pt-era data (a/1/2/9 is DP leftover)
     'battle_tower_trainers': 'a/2/0/2', # Real Pt-era data (a/1/2/8 is DP leftover)
+    'items': 'a/0/1/7',                  # 514 files, 34 bytes each
     'pokeathlon_performance': 'a/1/6/9', # Pokéathlon performance stats (554 entries, 20B each)
 }
 
@@ -993,18 +996,22 @@ def decode_gen4_text(data: bytes) -> list:
         if vals and vals[0] == 0xF100:
             bits = 0
             nbits = 0
+            raw_u16s = []
             for w in vals[1:]:
                 if w == 0xFFFF:
                     break
+                raw_u16s.append(w)
                 bits |= (w << nbits)
                 nbits += 16
             chars = []
+            raw_9bit = []
             while nbits >= 9:
                 c = bits & 0x1FF
                 bits >>= 9
                 nbits -= 9
                 if c == 0x1FF:
                     break
+                raw_9bit.append(c)
                 ch = _get_gen4_char(c)
                 if ch == '?':
                     chars.append(f'\\x{c:04X}')
@@ -1945,90 +1952,453 @@ def _decode_encounters_hgss(data: bytes) -> dict:
     return result if result else None
 
 
-def decode_contest(data: bytes, file_idx: int = 0) -> dict:
+def decode_items(data: bytes, file_idx: int = 0):
+    """Decode item data. Gen IV: 34 bytes, price direct. Gen V: 36 bytes, price * 10."""
+    items_list = text_tables.get('items', [])
+    desc_list = text_tables.get('item_descriptions', [])
+
+    name = items_list[file_idx] if file_idx < len(items_list) else f'Item #{file_idx}'
+    description = desc_list[file_idx] if file_idx < len(desc_list) else ''
+
+    if len(data) < 10:
+        return None
+
+    raw_price = struct.unpack_from('<H', data, 0)[0]
+    is_gen5 = len(data) >= 36
+    price = raw_price * 10 if is_gen5 else raw_price
+
+    fling_power = data[6] if len(data) > 6 else 0
+
+    lines = [name]
+    lines.append("")
+    if price > 0:
+        lines.append(f"Buy: ${price:,}")
+        lines.append(f"Sell: ${price // 2:,}")
+    else:
+        lines.append("Buy: Not sold in shops")
+    if fling_power > 0:
+        lines.append(f"Fling Power: {fling_power}")
+    if description:
+        lines.append("")
+        lines.append(description)
+
+    return "\n".join(lines)
+
+
+def decode_contest(data: bytes, file_idx: int = 0):
     """Decode Gen IV Contest data (Diamond/Pearl/Platinum).
-    File 0: Contest pokemon data (96 bytes per entry, 80 entries)
-    Format per entry:
-    - Offset 0-3: Unknown (u32)
-    - Offset 4-5: Species ID (u16)
-    - Offset 6-7: Unknown (u16)
-    - Offset 8-11: Unknown (u32)
-    - Offset 12+: Move IDs and other data
+    File 0: Contest pokemon data (96 bytes per entry, 80 entries).
     """
     if file_idx != 0 or len(data) < 96:
-        return {"raw": data.hex()}
-    
+        return None
+
     species_list = text_tables.get('species', [])
     moves_list = text_tables.get('moves', [])
-    
-    # Parse 96-byte entries
+
     num_entries = len(data) // 96
-    entries = []
-    
+    lines = ["Contest Hall", "", f"Pokemon: {num_entries}"]
+
     for i in range(num_entries):
         offset = i * 96
         entry_data = data[offset:offset + 96]
-        
-        # Parse species at offset 8-9 (based on hex analysis)
+
         species_id = struct.unpack_from('<H', entry_data, 8)[0]
         if species_id == 0 or species_id >= len(species_list):
             continue
-            
+
         species_name = species_list[species_id]
-        
-        # Parse moves (appears to be at offsets 12-19, 4 moves × 2 bytes)
         moves = []
         for m in range(4):
             move_id = struct.unpack_from('<H', entry_data, 12 + m * 2)[0]
             if move_id > 0 and move_id < len(moves_list):
                 moves.append(moves_list[move_id])
-        
-        entry = {
-            "species": species_name,
-            "species_id": species_id,
-        }
-        
+
+        lines.append("")
+        lines.append(f"  #{i+1:<4}{species_name}")
         if moves:
-            entry["moves"] = moves
-        
-        entries.append(entry)
-    
-    return {
-        "facility": "Contest Hall",
-        "count": len(entries),
-        "pokemon": entries
-    } if entries else {"raw": data.hex()}
+            lines.append(f"       {' / '.join(moves)}")
+
+    return "\n".join(lines)
 
 
-POKEATHLON_STATS = ['Speed', 'Power', 'Skill', 'Stamina', 'Jump']
+POKEATHLON_STATS = ['Power', 'Speed', 'Jump', 'Stamina', 'Skill']
 
 def decode_pokeathlon_performance(data: bytes, file_idx: int = 0) -> dict:
     """Decode Pokéathlon performance stats (HGSS only).
-    Cracked format: bytes 0-4 = base per stat, min/max pairs at (5,10),(11,12),(13,14),(15,16),(17,18).
-    Internal 0-4 maps to 1-5 stars.
+    Bytes 0-4: base values (Power, Speed, Jump, Stamina, Skill).
+    Bytes 5-8: constants. Bytes 9-18: min/max pairs per stat.
+    File N = species N+1 (no dummy entry). Internal 0-4 maps to 1-5 stars.
     """
     if len(data) != 20:
         return None
 
+    species_idx = file_idx + 1
     species_list = text_tables.get('species', [])
-    species_name = species_list[file_idx] if file_idx < len(species_list) else f"#{file_idx}"
+    species_name = species_list[species_idx] if species_idx < len(species_list) else f"#{species_idx}"
 
-    minmax = [(5, 10), (11, 12), (13, 14), (15, 16), (17, 18)]
     stats = {}
     for i, stat_name in enumerate(POKEATHLON_STATS):
-        mn = data[minmax[i][0]] + 1
-        mx = data[minmax[i][1]] + 1
-        if mn == mx:
-            stats[stat_name] = f"{mn}*"
+        base = data[i] + 1
+        mn = data[9 + i * 2] + 1
+        mx = data[10 + i * 2] + 1
+        if mn == base == mx:
+            stats[stat_name] = f"{base}★"
+        elif mn == base:
+            stats[stat_name] = f"{base}-{mx}★"
         else:
-            stats[stat_name] = f"{mn}/{mx}*"
+            stats[stat_name] = f"{mn}/{base}/{mx}★"
 
     return {
         "species": species_name,
-        "species_id": file_idx,
+        "species_id": species_idx,
         "facility": "Pokéathlon",
         "stats": stats
     }
+
+
+# ============ Template Formatters ============
+
+GRASS_SLOT_RATES = [20, 20, 10, 10, 10, 10, 5, 5, 4, 4, 1, 1]
+WATER_SLOT_RATES = [60, 30, 5, 4, 1]
+
+
+def _consolidate_slots(entries, rates):
+    """Consolidate species across encounter slots, summing rates."""
+    combined = {}
+    for i, entry in enumerate(entries):
+        name = entry['species']
+        rate = rates[i] if i < len(rates) else 0
+        if name not in combined:
+            combined[name] = {'rate': 0, 'levels': set()}
+        combined[name]['rate'] += rate
+        lvl_str = str(entry.get('level', 0))
+        if '-' in lvl_str:
+            lo, hi = lvl_str.split('-')
+            combined[name]['levels'].update(range(int(lo), int(hi) + 1))
+        else:
+            combined[name]['levels'].add(int(lvl_str))
+    result = []
+    for name, d in sorted(combined.items(), key=lambda x: -x[1]['rate']):
+        levels = sorted(d['levels'])
+        lv = f"Lv{levels[0]}" if len(levels) <= 1 else f"Lv{levels[0]}-{levels[-1]}"
+        result.append({'species': name, 'rate': d['rate'], 'level': lv})
+    return result
+
+
+def _format_section(entries, rates, header):
+    """Format a consolidated encounter section."""
+    consolidated = _consolidate_slots(entries, rates)
+    if not consolidated:
+        return ""
+    lines = [f"\n{header}:"]
+    for e in consolidated:
+        lines.append(f"  {e['species']:<17}{e['rate']:>3}%   {e['level']}")
+    return "\n".join(lines)
+
+
+def _format_encounter_hgss(decoded, file_idx):
+    """Format HGSS encounter data as template text."""
+    lines = []
+    grass = decoded.get('grass', {})
+    if grass and isinstance(grass, dict) and 'morning' in grass:
+        times = {}
+        for t in ['morning', 'day', 'night']:
+            entries = grass.get(t, [])
+            times[t] = {}
+            for i, entry in enumerate(entries):
+                name = entry['species']
+                rate = GRASS_SLOT_RATES[i] if i < len(GRASS_SLOT_RATES) else 0
+                if name not in times[t]:
+                    times[t][name] = {'rate': 0, 'levels': set()}
+                times[t][name]['rate'] += rate
+                times[t][name]['levels'].add(entry['level'])
+        all_species = set()
+        for td in times.values():
+            all_species.update(td.keys())
+        species_info = []
+        for sp in all_species:
+            m_rate = times['morning'].get(sp, {}).get('rate', 0)
+            d_rate = times['day'].get(sp, {}).get('rate', 0)
+            n_rate = times['night'].get(sp, {}).get('rate', 0)
+            all_levels = set()
+            for t in ['morning', 'day', 'night']:
+                if sp in times[t]:
+                    all_levels.update(times[t][sp]['levels'])
+            levels = sorted(all_levels)
+            lv = f"Lv{levels[0]}" if len(levels) <= 1 else f"Lv{levels[0]}-{levels[-1]}"
+            if m_rate == d_rate == n_rate and m_rate > 0:
+                rate_str = f"{m_rate}%"
+            else:
+                rate_groups = {}
+                for rate, tname in [(m_rate, 'Morning'), (d_rate, 'Day'), (n_rate, 'Night')]:
+                    if rate > 0:
+                        rate_groups.setdefault(rate, []).append(tname)
+                parts = []
+                for rate, tnames in sorted(rate_groups.items(), reverse=True):
+                    parts.append(f"{rate}% ({', '.join(tnames)})")
+                rate_str = " / ".join(parts)
+            species_info.append({'species': sp, 'rate_str': rate_str, 'level': lv, 'sort_key': max(m_rate, d_rate, n_rate)})
+        species_info.sort(key=lambda x: -x['sort_key'])
+        lines.append("Grass (Default):")
+        for si in species_info:
+            lines.append(f"  {si['species']:<17}{si['rate_str']:<40}{si['level']}")
+
+    water_sections = [
+        ('surf', 'Surf (Default)'), ('rock_smash', 'Rock Smash'),
+        ('old_rod', 'Fishing (Old Rod)'), ('good_rod', 'Fishing (Good Rod)'),
+        ('super_rod', 'Fishing (Super Rod)'),
+    ]
+    for key, header in water_sections:
+        entries = decoded.get(key, [])
+        if entries:
+            section = _format_section(entries, WATER_SLOT_RATES, header)
+            if section:
+                lines.append(section)
+
+    sound = decoded.get('sound', {})
+    if sound:
+        hoenn = sound.get('hoenn', [])
+        sinnoh = sound.get('sinnoh', [])
+        if hoenn:
+            lines.append(f"\nGrass (Hoenn Sound):\n  {', '.join(hoenn)}")
+        if sinnoh:
+            lines.append(f"\nGrass (Sinnoh Sound):\n  {', '.join(sinnoh)}")
+
+    return "\n".join(lines).strip() if lines else None
+
+
+def _format_encounter_gen5(decoded, file_idx):
+    """Format Gen V encounter data as template text."""
+    seasons_data = decoded.get('seasons', None)
+    if seasons_data:
+        return _format_encounter_gen5_seasonal(seasons_data, file_idx)
+
+    lines = []
+    location = decoded.get('location', '')
+    if location:
+        lines.append(f"Location: {location}\n")
+
+    sections = [
+        ('grass', 'Grass (Default)', GRASS_SLOT_RATES),
+        ('double_grass', 'Dark Grass', GRASS_SLOT_RATES),
+        ('special_grass', 'Shaking Grass', GRASS_SLOT_RATES),
+        ('surf', 'Surf (Default)', WATER_SLOT_RATES),
+        ('special_surf', 'Rippling Water', WATER_SLOT_RATES),
+        ('fishing', 'Fishing (Default)', WATER_SLOT_RATES),
+        ('special_fishing', 'Fishing (Rippling)', WATER_SLOT_RATES),
+    ]
+    for key, header, rates in sections:
+        entries = decoded.get(key, [])
+        if entries:
+            section = _format_section(entries, rates, header)
+            if section:
+                lines.append(section)
+
+    return "\n".join(lines).strip() if lines else None
+
+
+def _format_encounter_gen5_seasonal(seasons, file_idx):
+    """Format Gen V seasonal encounters with inline season notes."""
+    section_types = [
+        ('grass', 'Grass (Default)', GRASS_SLOT_RATES),
+        ('double_grass', 'Dark Grass', GRASS_SLOT_RATES),
+        ('special_grass', 'Shaking Grass', GRASS_SLOT_RATES),
+        ('surf', 'Surf (Default)', WATER_SLOT_RATES),
+        ('special_surf', 'Rippling Water', WATER_SLOT_RATES),
+        ('fishing', 'Fishing (Default)', WATER_SLOT_RATES),
+        ('special_fishing', 'Fishing (Rippling)', WATER_SLOT_RATES),
+    ]
+    season_names = ['Spring', 'Summer', 'Fall', 'Winter']
+    lines = []
+    location = seasons[0].get('location', '') if seasons else ''
+    if location:
+        lines.append(f"Location: {location}\n")
+
+    for key, header, rates in section_types:
+        season_consolidated = []
+        has_data = False
+        for s in seasons:
+            entries = s.get(key, [])
+            if entries:
+                has_data = True
+                season_consolidated.append(_consolidate_slots(entries, rates))
+            else:
+                season_consolidated.append([])
+        if not has_data:
+            continue
+        all_species = set()
+        for sc in season_consolidated:
+            for e in sc:
+                all_species.add(e['species'])
+        species_info = []
+        for sp in all_species:
+            season_rates = []
+            all_levels = set()
+            for si, sc in enumerate(season_consolidated):
+                rate = 0
+                for e in sc:
+                    if e['species'] == sp:
+                        rate = e['rate']
+                        lv = e['level'].replace('Lv', '')
+                        if '-' in lv:
+                            lo, hi = lv.split('-')
+                            all_levels.update(range(int(lo), int(hi) + 1))
+                        else:
+                            all_levels.add(int(lv))
+                        break
+                season_rates.append(rate)
+            levels = sorted(all_levels)
+            lv = f"Lv{levels[0]}" if len(levels) <= 1 else f"Lv{levels[0]}-{levels[-1]}"
+            if all(r == season_rates[0] for r in season_rates):
+                rate_str = f"{season_rates[0]}%"
+            else:
+                rate_groups = {}
+                for i, rate in enumerate(season_rates):
+                    if rate > 0 and i < len(season_names):
+                        rate_groups.setdefault(rate, []).append(season_names[i])
+                parts = []
+                for rate, snames in sorted(rate_groups.items(), reverse=True):
+                    parts.append(f"{rate}% ({', '.join(snames)})")
+                rate_str = " / ".join(parts)
+            species_info.append({'species': sp, 'rate_str': rate_str, 'level': lv, 'sort_key': max(season_rates)})
+        species_info.sort(key=lambda x: -x['sort_key'])
+        lines.append(f"\n{header}:")
+        for si in species_info:
+            lines.append(f"  {si['species']:<17}{si['rate_str']:<45}{si['level']}")
+
+    return "\n".join(lines).strip() if lines else None
+
+
+def _format_encounter_dpp(decoded, file_idx):
+    """Format DPPt encounter data as template text."""
+    lines = []
+    grass = decoded.get('grass', [])
+    if grass:
+        section = _format_section(grass, GRASS_SLOT_RATES, "Grass (Default)")
+        if section:
+            lines.append(section)
+    for key, label in [('swarm', 'Swarm'), ('day_replacements', 'Day'), ('night_replacements', 'Night'), ('radar', 'Radar')]:
+        species = decoded.get(key, [])
+        if species:
+            names = species if isinstance(species[0], str) else [e['species'] for e in species]
+            lines.append(f"\nGrass ({label}):\n  {', '.join(names)}")
+    water_sections = [
+        ('surf', 'Surf (Default)'), ('surf_special', 'Surf (Special)'),
+        ('old_rod', 'Fishing (Old Rod)'), ('good_rod', 'Fishing (Good Rod)'),
+        ('super_rod', 'Fishing (Super Rod)'),
+    ]
+    for key, header in water_sections:
+        entries = decoded.get(key, [])
+        if entries:
+            section = _format_section(entries, WATER_SLOT_RATES, header)
+            if section:
+                lines.append(section)
+    return "\n".join(lines).strip() if lines else None
+
+
+def format_encounter(decoded, file_idx):
+    """Format encounter data as template text."""
+    if not decoded:
+        return None
+    if 'seasons' in decoded:
+        return _format_encounter_gen5(decoded, file_idx)
+    grass = decoded.get('grass', {})
+    if isinstance(grass, dict) and 'morning' in grass:
+        return _format_encounter_hgss(decoded, file_idx)
+    if isinstance(grass, list):
+        gen = text_gen or 5
+        if gen == 5:
+            return _format_encounter_gen5(decoded, file_idx)
+        else:
+            return _format_encounter_dpp(decoded, file_idx)
+    # No grass section — route by gen for water-only areas
+    gen = text_gen or 5
+    if any(k in decoded for k in ('surf', 'special_surf', 'fishing', 'special_fishing', 'double_grass', 'special_grass')):
+        if gen == 5:
+            return _format_encounter_gen5(decoded, file_idx)
+    if any(k in decoded for k in ('surf', 'old_rod', 'good_rod', 'super_rod', 'rock_smash', 'sound')):
+        if gen == 4:
+            return _format_encounter_hgss(decoded, file_idx)
+    return None
+
+
+def format_trainer(file_idx):
+    """Eagerly load trdata + trpoke and format as template text."""
+    narcs = GAME_INFO.get(current_rom['header']['game_code'], {}).get('narcs', {})
+    rom = current_rom['rom']
+
+    try:
+        td_path = narcs.get('trdata', '')
+        td_narc = ndspy.narc.NARC(rom.getFileByName(td_path))
+        if file_idx >= len(td_narc.files):
+            return None
+        td_data = td_narc.files[file_idx]
+        trdata = decode_trdata(td_data, file_idx)
+        if not trdata:
+            return None
+
+        tp_path = narcs.get('trpoke', '')
+        tp_narc = ndspy.narc.NARC(rom.getFileByName(tp_path))
+        if file_idx >= len(tp_narc.files):
+            return None
+        tp_data = tp_narc.files[file_idx]
+        trpoke = decode_trpoke(tp_data, td_data)
+
+        template = td_data[0] & 0x03
+        poke_size = TRPOKE_FORMATS.get(template, 8)
+        num_pokemon = len(tp_data) // poke_size
+        prize = 0
+        if num_pokemon > 0:
+            last_off = (num_pokemon - 1) * poke_size
+            last_level = tp_data[last_off + 2]
+            prize = trdata.get("reward_multiplier", 0) * last_level * 4
+
+        class_name = trdata.get('class', '???')
+        trainer_name = trdata.get('name', f'Trainer #{file_idx}')
+        battle_type = trdata.get('battle_type', 'Single')
+
+        lines = [f"{class_name} {trainer_name}"]
+        lines.append("")
+        lines.append(f"Number of Pokemon: {trdata.get('num_pokemon', '?')}")
+        lines.append(f"Format: {battle_type}")
+
+        items = trdata.get('battle_items', 'None')
+        if isinstance(items, list) and items:
+            lines.append(f"Items: {', '.join(items)}")
+
+        ai = trdata.get('ai_flags', [])
+        if ai:
+            lines.append(f"AI: {', '.join(ai)}")
+
+        if prize > 0:
+            lines.append(f"Prize: ${prize:,}")
+
+        pokemon = trpoke.get('pokemon', [])
+        for i, poke in enumerate(pokemon):
+            lines.append("")
+            species = poke.get('species', '???')
+            level = poke.get('level', '?')
+            ivs = poke.get('ivs', '?')
+            ability = poke.get('ability', '--')
+            held = poke.get('held_item', None)
+
+            extras = []
+            if ability and ability != '--':
+                extras.append(ability)
+            if held and held != 'None':
+                extras.append(held)
+            extra_str = f"   [{' | '.join(extras)}]" if extras else ""
+            lines.append(f"  #{i+1}  {species:<15}Lv{level}   IVs: {ivs}{extra_str}")
+
+            moves = poke.get('moves', [])
+            if moves:
+                move_str = " / ".join(m for m in moves if m != '---')
+                if move_str:
+                    lines.append(f"      {move_str}")
+
+        return "\n".join(lines)
+    except Exception:
+        return None
 
 
 def _format_hex(data: bytes, base_offset: int = 0) -> str:
@@ -2058,31 +2428,9 @@ def _auto_decode(path: str, data: bytes):
     rom = current_rom['rom']
 
     try:
-        if role == 'trpoke':
-            trdata_path = narcs.get('trdata', '')
-            td_narc = ndspy.narc.NARC(rom.getFileByName(trdata_path))
-            td = td_narc.files[file_idx] if file_idx < len(td_narc.files) else None
-            decoded = decode_trpoke(data, td)
-            decoded["trainer_index"] = file_idx
-            trainer_names = text_tables.get('trainer_names', [])
-            if file_idx < len(trainer_names):
-                decoded["trainer_name"] = trainer_names[file_idx]
-            return decoded
-        elif role == 'trdata':
-            decoded = decode_trdata(data, file_idx)
-            trpoke_path = narcs.get('trpoke', '')
-            tp_narc = ndspy.narc.NARC(rom.getFileByName(trpoke_path))
-            if file_idx < len(tp_narc.files):
-                tp_data = tp_narc.files[file_idx]
-                template = data[0] & 0x03
-                poke_size = TRPOKE_FORMATS.get(template, 8)
-                num_pokemon = len(tp_data) // poke_size
-                if num_pokemon > 0:
-                    last_off = (num_pokemon - 1) * poke_size
-                    last_level = tp_data[last_off + 2]
-                    multiplier = decoded.get("reward_multiplier", 0)
-                    decoded["prize_money"] = multiplier * last_level * 4
-            return decoded
+        if role in ('trpoke', 'trdata'):
+            formatted = format_trainer(file_idx)
+            return formatted
         elif role == 'personal':
             return decode_personal(data, file_idx)
         elif role == 'learnsets':
@@ -2094,10 +2442,12 @@ def _auto_decode(path: str, data: bytes):
         elif role == 'encounters':
             decoded = decode_encounters(data)
             if decoded:
-                location_names = text_tables.get('location_names', [])
-                if file_idx < len(location_names):
-                    decoded['location'] = location_names[file_idx]
-                return decoded
+                if text_gen == 5:
+                    location_names = text_tables.get('location_names', [])
+                    if file_idx < len(location_names):
+                        decoded['location'] = location_names[file_idx]
+                formatted = format_encounter(decoded, file_idx)
+                return formatted if formatted else decoded
         elif role in ('pwt_rosters', 'pwt_rosters_b'):
             decoded = decode_pwt_roster(data)
             if decoded:
@@ -2144,6 +2494,8 @@ def _auto_decode(path: str, data: bytes):
             return decode_pokeathlon_performance(data, file_idx)
         elif role == 'contest':
             return decode_contest(data, file_idx)
+        elif role == 'items':
+            return decode_items(data, file_idx)
     except Exception:
         pass
 
@@ -2937,6 +3289,30 @@ async def call_tool(name: str, arguments: dict):
         raise ValueError(f"Unknown tool: {name}")
     
     result = await handler(**arguments)
+
+    # When decipher returns decoded strings (template text), present cleanly
+    if name == 'decipher' and isinstance(result, dict):
+        # Multi-file reads
+        if result.get('multi') and isinstance(result.get('results'), list):
+            blocks = []
+            for sub in result['results']:
+                decoded = sub.get('decoded') if isinstance(sub, dict) else None
+                if isinstance(decoded, str):
+                    meta = {k: v for k, v in sub.items() if k not in ('decoded', 'hex')}
+                    blocks.append(TextContent(type="text", text=decoded))
+                    blocks.append(TextContent(type="text", text=json.dumps(meta, indent=2)))
+                else:
+                    blocks.append(TextContent(type="text", text=json.dumps(sub, indent=2)))
+            return blocks
+        # Single file
+        decoded = result.get('decoded')
+        if isinstance(decoded, str):
+            meta = {k: v for k, v in result.items() if k not in ('decoded', 'hex')}
+            return [
+                TextContent(type="text", text=decoded),
+                TextContent(type="text", text=json.dumps(meta, indent=2))
+            ]
+
     return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
