@@ -11,6 +11,7 @@ import subprocess
 import struct
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 from mcp.server import Server
@@ -33,6 +34,16 @@ import ndspy.narc
 import ndspy.fnt
 import ndspy.lz10
 
+# ARM disassembler for probe reads="arm"/"thumb"
+try:
+    import capstone
+    _cs_arm = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM | capstone.CS_MODE_LITTLE_ENDIAN)
+    _cs_thumb = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_THUMB | capstone.CS_MODE_LITTLE_ENDIAN)
+    _cs_arm.detail = False
+    _cs_thumb.detail = False
+except ImportError:
+    _cs_arm = _cs_thumb = None
+
 server = Server("linkplay")
 
 # State
@@ -44,11 +55,39 @@ text_mult = None   # Derived once from species file (Gen V only)
 text_gen = None    # 4 or 5, set during bootstrap
 narc_roles = {}    # Reverse map: narc_path -> role (e.g. 'a/0/9/2' -> 'trpoke')
 tm_table = []      # Indexed by bit position: [(label, move_id), ...] — populated at ROM open
-f100_table = None  # 512-entry list: 9-bit index -> Gen4 char code. Discovered from ARM9.
 loaded_roms = {}   # game_code -> saved state for multi-ROM support
 _narc_cache = {}   # (game_code, narc_path) -> parsed ndspy.narc.NARC
+_rom_restore_done = False  # Flipped once after first tool call triggers restore
 eonet_labels = {}  # game_code -> {narc_path: {'role': str, 'labels': {idx: 'Name (Role)'}}}
 eonet_index = {}   # game_code -> [{name_lower: str, path: str, role: str, idx: int}, ...]
+
+
+async def _do_pending_restore():
+    """Load any ROMs from last_rom.json that aren't already in loaded_roms. Runs once."""
+    global _rom_restore_done
+    if _rom_restore_done:
+        return
+    _rom_restore_done = True
+    try:
+        reg_path = Path.home() / ".linkplay" / "last_rom.json"
+        if not reg_path.exists():
+            return
+        registry = json.loads(reg_path.read_text(encoding='utf-8'))
+        if 'game_code' in registry:
+            registry = {registry['game_code']: registry['path']}
+        for gc, rom_path in registry.items():
+            if gc in loaded_roms:
+                continue
+            if not rom_path or not Path(rom_path).exists():
+                print(f"[linkplay] Registry ROM not found, skipping: {gc} → {rom_path}", file=sys.stderr, flush=True)
+                continue
+            try:
+                await spotlight(rom_path)
+                print(f"[linkplay] Auto-restored ROM: {gc}", file=sys.stderr, flush=True)
+            except Exception as e:
+                print(f"[linkplay] Failed to restore {gc}: {e}", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[linkplay] Registry restore error: {e}", file=sys.stderr, flush=True)
 
 
 def _get_narc(narc_path: str):
@@ -150,68 +189,123 @@ def ensure_dirs():
     flipnotes_dir.mkdir(parents=True, exist_ok=True)
 
 
+def _note_belongs_to_game(path: str, game_codes: list) -> bool:
+    """Return True if this note path belongs in a flipnote covering game_codes."""
+    codes = set(game_codes)
+    gen5_bw  = {'IRB', 'IRA'}
+    gen5_bw2 = {'IRE', 'IRD'}
+    hgss     = {'IPK', 'IPG'}
+    gen4     = {'ADA', 'APA', 'CPU', 'IPK', 'IPG'}
+    dp_pt    = {'ADA', 'APA', 'CPU'}
+
+    # Paths starting with a/ or arm9 or swan_ are gen5 (either BW or BW2).
+    # If the note has an explicit game= field that was stored, use it.
+    # Otherwise fall back to path heuristics.
+    if any(path.startswith(p) for p in ('poketool/', 'msgdata/', 'fielddata/',
+                                         'battle/', 'itemtool/', 'contest/')):
+        # Named gen4 paths
+        if 'pl_' in path.split('/')[-1]:
+            # Platinum-specific override files
+            return bool(codes & dp_pt)
+        return bool(codes & gen4)
+
+    if path.startswith('arm9') or path.startswith('swan_'):
+        # ARM9 patches / sound archive written for BW2
+        return bool(codes & gen5_bw2)
+
+    if path.startswith('a/') or path.startswith('_'):
+        # Determine gen from path structure:
+        # HGSS a/ paths were written during HGSS sessions:
+        #   a/0/0/2, a/0/1/1, a/0/2/7, a/0/3/3, a/0/3/4, a/0/5/5, a/0/5/6
+        #   a/1/2/8, a/1/2/9, a/1/3/6, a/1/6/9, a/2/0/2, a/2/0/3, a/2/0/4
+        # BW2 a/ paths were written during BW2 sessions:
+        #   a/0/0/2:xx, a/0/0/4, a/0/5/1, a/0/9/, a/1/2/4, a/1/2/6, a/3, a/3/0, a/3/0/7
+        base = path.split(':')[0]
+        bw2_bases = {
+            'a/0/0/4', 'a/0/5/1', 'a/0/9/', 'a/0/9',
+            'a/1/2/4', 'a/1/2/6', 'a/3', 'a/3/0', 'a/3/0/7',
+        }
+        hgss_bases = {
+            'a/0/0/2', 'a/0/1/1', 'a/0/2/7', 'a/0/3/3', 'a/0/3/4',
+            'a/0/5/5', 'a/0/5/6', 'a/1/2/8', 'a/1/2/9', 'a/1/3/6',
+            'a/1/6/9', 'a/2/0/2', 'a/2/0/3', 'a/2/0/4',
+        }
+        meta_paths = {'_issues', '_test_note'}
+
+        # Sub-paths of a/0/0/2 (like a/0/0/2:64) are BW2
+        if ':' in path and path.split(':')[0] == 'a/0/0/2':
+            return bool(codes & gen5_bw2)
+        if base in bw2_bases:
+            return bool(codes & gen5_bw2)
+        if base in hgss_bases or path in meta_paths:
+            return bool(codes & hgss)
+        # Unknown a/ path: keep in gen5 only (safest default)
+        return bool(codes & (gen5_bw | gen5_bw2))
+
+    # Unknown path: write everywhere to be safe
+    return True
+
+
 def recover_notes_from_logs():
     """Mine Claude Code conversation logs for past note() calls. Replay them.
 
     Scans every .jsonl in the project's .claude directory for mcp__linkplay__note
-    tool calls. Extracts the input (path, description, name, tags, etc.) and
-    writes them to the appropriate flipnote. Doesn't duplicate — skips notes
-    that already exist (unless they're ICR-generated).
+    and mcp__linkplay__batch_notes tool calls. Writes each note only to the
+    flipnote(s) it actually belongs to, based on path heuristics and explicit
+    game= fields. Never writes ICR-sourced notes into flipnotes.
 
-    This runs on server startup. Every note ever written through any conversation
-    gets recovered. Months of progress, restored.
+    This runs on server startup.
     """
     claude_dir = Path.home() / ".claude" / "projects"
     if not claude_dir.exists():
         return 0
 
-    # Find all project dirs that could be LinkPlay
     recovered = 0
-    seen_notes = {}  # (path) -> input dict, deduplicate across conversations
+    seen_notes = {}  # path -> input dict (latest wins)
 
     for project_dir in claude_dir.iterdir():
         if not project_dir.is_dir():
             continue
-        # Scan all .jsonl files (main conversations + subagents)
         for jsonl_file in project_dir.rglob("*.jsonl"):
             try:
-                with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
+                with open(jsonl_file, 'r', encoding='utf-8', errors='ignore') as fh:
+                    for line in fh:
                         if 'mcp__linkplay__note' not in line:
                             continue
                         try:
                             entry = json.loads(line)
                         except:
                             continue
-                        # Find tool_use entries with note input
                         msg = entry.get('message', {})
-                        content = msg.get('content', [])
-                        if not isinstance(content, list):
-                            continue
-                        for block in content:
+                        for block in msg.get('content', []):
                             if not isinstance(block, dict):
                                 continue
-                            if block.get('name') != 'mcp__linkplay__note':
-                                continue
+                            bname = block.get('name', '')
                             inp = block.get('input', {})
-                            path = inp.get('path')
-                            desc = inp.get('description')
-                            if path and desc:
-                                # Keep the latest version of each note
-                                seen_notes[path] = inp
+                            if bname == 'mcp__linkplay__note':
+                                path = inp.get('path')
+                                if path and inp.get('description'):
+                                    seen_notes[path] = inp
+                            elif bname == 'mcp__linkplay__batch_notes':
+                                game = inp.get('game', '')
+                                for note in inp.get('notes', []):
+                                    path = note.get('path')
+                                    if path and note.get('description'):
+                                        if game and 'game' not in note:
+                                            note = dict(note, game=game)
+                                        seen_notes[path] = note
             except:
                 continue
 
     # Also check server's own note history
     if note_history.exists():
         try:
-            with open(note_history, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
+            with open(note_history, 'r', encoding='utf-8', errors='ignore') as fh:
+                for line in fh:
                     try:
                         inp = json.loads(line.strip())
                         path = inp.get('path')
-                        desc = inp.get('description')
-                        if path and desc:
+                        if path and inp.get('description'):
                             seen_notes[path] = inp
                     except:
                         continue
@@ -221,21 +315,31 @@ def recover_notes_from_logs():
     if not seen_notes:
         return 0
 
-    # Write recovered notes to ALL flipnotes (notes aren't game-specific in the logs)
-    # Each flipnote gets the notes — the paths will match the right game
+    # Write each note only to the flipnote(s) it belongs to
     for fpn_file in flipnotes_dir.glob("*.fpn"):
         try:
-            with open(fpn_file, 'r', encoding='utf-8') as f:
-                fpn_data = json.load(f)
+            with open(fpn_file, 'r', encoding='utf-8') as fh:
+                fpn_data = json.load(fh)
         except:
             continue
 
+        game_codes = fpn_data.get('game_codes', [fpn_data.get('game_code', '')])
         fpn_data.setdefault('notes', {})
         wrote = False
+
         for path, inp in seen_notes.items():
-            existing = fpn_data['notes'].get(path)
-            # Don't overwrite existing manual notes, only fill gaps or replace ICR
-            if existing and isinstance(existing, dict) and existing.get('source') != 'icr':
+            # Never write ICR notes into flipnotes
+            if inp.get('source') == 'icr':
+                continue
+            # Respect explicit game= if present
+            explicit_game = inp.get('game', '')
+            if explicit_game and explicit_game not in game_codes:
+                continue
+            # Path-based routing when no explicit game
+            if not explicit_game and not _note_belongs_to_game(path, game_codes):
+                continue
+            # Don't overwrite existing manual notes
+            if path in fpn_data['notes']:
                 continue
             note_entry = {"description": inp['description']}
             if inp.get('name'): note_entry['name'] = inp['name']
@@ -248,16 +352,12 @@ def recover_notes_from_logs():
             recovered += 1
 
         if wrote:
-            with open(fpn_file, 'w', encoding='utf-8') as f:
-                json.dump(fpn_data, f, indent=2, ensure_ascii=False)
+            with open(fpn_file, 'w', encoding='utf-8') as fh:
+                json.dump(fpn_data, fh, indent=2, ensure_ascii=False)
 
-    # Consolidate: move notes from individual flipnotes into shared ones
-    # Diamond.fpn notes → Pokémon_Diamond_&_Pearl.fpn, etc.
     _consolidate_flipnotes()
 
     return recovered
-
-
 def _consolidate_flipnotes():
     """Merge notes from individual ROM flipnotes into shared partner flipnotes.
 
@@ -585,6 +685,17 @@ def build_nds_structure(rom, rom_path: str) -> tuple:
     rom_stats['files']['arm9.bin'] = {'size': len(rom.arm9), 'type': 'binary'}
     rom_stats['files']['arm7.bin'] = {'size': len(rom.arm7), 'type': 'binary'}
 
+    # Add overlays to tree
+    try:
+        parsed_ovs = rom.loadArm9Overlays()
+        for ov_id in sorted(parsed_ovs.keys()):
+            ov = parsed_ovs[ov_id]
+            ov_name = f"overlay{ov_id}.bin"
+            tree.append(ov_name)
+            rom_stats['files'][ov_name] = {'size': len(ov.data), 'type': 'overlay'}
+    except Exception:
+        pass
+
     def walk_folder(folder, path=""):
         for filename in folder.files:
             full_path = f"{path}/{filename}" if path else filename
@@ -638,6 +749,27 @@ def compress_arm9(arm9_path: str):
         subprocess.run([blz_path, '-en9', arm9_path], check=True, capture_output=True)
     except:
         pass
+
+
+def _load_overlays(rom) -> dict:
+    """Load all ARM9 overlays from ROM via ndspy's loadArm9Overlays().
+    Returns {overlay_id: bytearray(decompressed_data)}.
+    ndspy handles LZ10 decompression automatically.
+    """
+    overlays = {}
+    try:
+        parsed = rom.loadArm9Overlays()  # {int overlayID: ndspy.code.Overlay}
+        for ov_id, ov in parsed.items():
+            overlays[ov_id] = bytearray(ov.data)
+    except Exception:
+        pass
+    return overlays
+
+
+def _is_overlay_path(path: str) -> int:
+    """Check if path is an overlay reference like 'overlay2.bin'. Returns overlay ID or -1."""
+    m = re.match(r'^overlay(\d+)\.bin$', path.lower().strip('/'))
+    return int(m.group(1)) if m else -1
 
 
 def detect_compression(data: bytes) -> str:
@@ -837,7 +969,7 @@ def decode_gen5_text(data: bytes, mult: int = 0x2983) -> list:
                 param_count = vals[j] if j < len(vals) else 0
                 j += 1
                 j += param_count  # skip params
-                if ctrl_type == 0x0000:
+                if ctrl_type == 0x0000 or ctrl_type & 0xFF00 == 0x0000:
                     chars.append('\n')
                 elif ctrl_type & 0xFF00 == 0x0100:
                     chars.append('[var]')
@@ -868,6 +1000,7 @@ _GEN5_B2W2 = {
     'evolutions': 'a/0/1/9',
     'move_data': 'a/0/2/1',
     'items': 'a/0/2/4',
+    'baby_species': 'a/0/2/0',  # Maps species→baby form (NOT egg moves)
 }
 _GEN5_BW1 = {
     'text': 'a/0/0/2',
@@ -878,6 +1011,8 @@ _GEN5_BW1 = {
     'evolutions': 'a/0/1/9',
     'move_data': 'a/0/2/1',
     'items': 'a/0/2/4',
+    'baby_species': 'a/0/2/0',  # Maps species→baby form (NOT egg moves)
+    'egg_moves': 'a/0/2/0',
 }
 _BW1_ENCOUNTERS = {
     'encounters': 'a/1/2/6',  # 112 files, 232 bytes each
@@ -896,6 +1031,11 @@ _B2W2_PWT = {
     'pwt_champions_b': 'a/2/5/7',      # 1000 pokemon pools B
     'pwt_download': 'a/2/5/8',         # 1 file — download tournament metadata (multilingual)
     'pwt_ui': 'a/2/5/9',              # 9 files — UI graphics (RLCN/RGCN/RCSN)
+    'pwt_trainers_2': 'a/2/4/8',      # 120 trainer configs (secondary tournament set)
+    'pwt_rosters_2': 'a/2/4/9',        # 120 rosters (secondary tournament set)
+    'pwt_mix': 'a/2/6/1',              # 1000 pokemon pool (Mix Tournament)
+    'pwt_defs': 'a/2/6/9',             # 42 tournament definitions (1688B each)
+    'pwt_trainer_map': 'a/2/4/0',      # trainer index → name/sprite mapping (20B stride, u16[8]=class_id)
 }
 _B2W2_SUBWAY = {
     'subway_pokemon': 'a/2/1/1',       # 1000 pokemon pool (16B, same format as PWT)
@@ -910,6 +1050,7 @@ _GEN4_COMMON = {
     'personal':  'poketool/personal/personal.narc',
     'learnsets': 'poketool/personal/wotbl.narc',
     'evolutions': 'poketool/personal/evo.narc',
+    'baby_species': 'poketool/personal/pms.narc',  # Maps species→baby form (NOT egg moves)
     'move_data': 'poketool/waza/waza_tbl.narc',
     'trdata':    'poketool/trainer/trdata.narc',
     'trpoke':    'poketool/trainer/trpoke.narc',
@@ -971,6 +1112,7 @@ TABLE_FINGERPRINTS = {
     'abilities':      [(1, "Stench"), (22, "Intimidate")],
     'natures':        [(0, "Hardy"), (1, "Lonely"), (3, "Adamant")],
     'type_names':     [(0, "Normal"), (1, "Fighting"), (2, "Flying")],
+    'tournament_names': [(4, "Champions Tournament"), (13, "Rental Tournament")],
 }
 
 # Heuristic markers — tables without unique index-based fingerprints.
@@ -979,6 +1121,18 @@ TABLE_FINGERPRINTS = {
 HEURISTIC_MARKERS = {
     'trainer_classes': ["Youngster", "Lass", "School Kid"],
     'location_names':  ["Mystery Zone"],
+    'trainer_names':   ["Palmer", "Cynthia"],
+    'trainer_names_gen5': ["Bianca", "Shauntal", "Grimsley"],
+}
+
+# Substring markers: all strings must appear as substrings within at least one entry.
+# Must work across Gen IV (different wording, ê instead of é) AND Gen V.
+HEURISTIC_SUBSTR = {
+    'item_descriptions':  ["best Ball with the ultimate"],
+    'move_descriptions':  ["pounded with a long tail"],
+    'ability_descriptions': ["repel wild"],
+    'pokedex_flavor':     ["seed on its back"],
+    'pokedex_category':   ["Seed Pok", "Lizard Pok"],
 }
 
 
@@ -1011,33 +1165,90 @@ def auto_detect_tables() -> dict:
                 text_tables[table_name] = strings
                 found[table_name] = file_idx
 
-    # Pass 3: adjacency — trainer_names is usually near trainer_classes
-    if 'trainer_classes' in found and 'trainer_names' not in found:
-        tc_idx = found['trainer_classes']
-        for offset in [-1, -2, 1, 2]:
-            candidate = tc_idx + offset
-            if candidate in text_tables and isinstance(text_tables[candidate], list):
-                entries = text_tables[candidate]
-                if len(entries) > 100 and candidate not in found.values():
-                    text_tables['trainer_names'] = entries
-                    found['trainer_names'] = candidate
-                    break
+    # Pass 2b: substring markers
+    for file_idx in sorted(k for k in text_tables if isinstance(k, int)):
+        strings = text_tables[file_idx]
+        if not isinstance(strings, list):
+            continue
+        for table_name, markers in HEURISTIC_SUBSTR.items():
+            if table_name in found:
+                continue
+            joined = ' '.join(s for s in strings if isinstance(s, str)).lower()
+            if all(m.lower() in joined for m in markers):
+                text_tables[table_name] = strings
+                found[table_name] = file_idx
 
-    # Pass 4: description tables — usually adjacent to their name tables
+    # Promote trainer_names_gen5 -> trainer_names if Gen IV version wasn't found
+    if 'trainer_names' not in found and 'trainer_names_gen5' in found:
+        found['trainer_names'] = found.pop('trainer_names_gen5')
+        text_tables['trainer_names'] = text_tables.pop('trainer_names_gen5')
+    elif 'trainer_names_gen5' in found:
+        found.pop('trainer_names_gen5')
+        text_tables.pop('trainer_names_gen5', None)
+
+    # Pass 3b: Gen IV has TWO trainer name files — generic NPC names and battle
+    # trainer names. Heuristic markers match both. Use PPRE-verified indices.
+    VERIFIED_TRAINER_NAMES = {
+        'ADA': 559, 'APA': 559,   # Diamond / Pearl
+        'CPU': 618,                # Platinum
+        'IPK': 729, 'IPG': 729,   # HeartGold / SoulSilver
+    }
+    gc = current_rom['header']['game_code'] if current_rom else None
+    if gc in VERIFIED_TRAINER_NAMES:
+        correct_idx = VERIFIED_TRAINER_NAMES[gc]
+        if correct_idx in text_tables and isinstance(text_tables[correct_idx], list):
+            old_idx = found.get('trainer_names')
+            if old_idx is not None and old_idx != correct_idx:
+                text_tables['npc_names'] = text_tables[old_idx]
+                found['npc_names'] = old_idx
+            text_tables['trainer_names'] = text_tables[correct_idx]
+            found['trainer_names'] = correct_idx
+
+    # Pass 4: description tables — usually near their name tables.
+    # Gen V: typically ±1. Gen IV: can be ±1 to ±3.
+    # Descriptions have similar entry count but longer average string length.
     for name_tbl, desc_tbl in [('items', 'item_descriptions'), ('moves', 'move_descriptions'), ('abilities', 'ability_descriptions')]:
         if name_tbl in found and desc_tbl not in found:
             name_idx = found[name_tbl]
             name_count = len(text_tables[name_tbl])
-            for offset in [-1, 1]:
+            for offset in [-1, 1, -2, 2, -3, 3]:
                 candidate = name_idx + offset
                 if candidate in text_tables and isinstance(text_tables[candidate], list) and candidate not in found.values():
                     entries = text_tables[candidate]
                     if abs(len(entries) - name_count) < 10:
                         avg_len = sum(len(s) for s in entries[:20]) / max(1, min(20, len(entries)))
-                        if avg_len > 20:  # descriptions are longer than names
+                        if avg_len > 10:  # descriptions longer than names (Gen IV can be short)
                             text_tables[desc_tbl] = entries
                             found[desc_tbl] = candidate
                             break
+
+    # Pass 5: verified description indices (BW2 confirmed from PPRE)
+    VERIFIED_DESCS = {
+        'IRE': {'item_descriptions': 63, 'ability_descriptions': 375, 'move_descriptions': 402},
+        'IRD': {'item_descriptions': 63, 'ability_descriptions': 375, 'move_descriptions': 402},
+    }
+    if gc in VERIFIED_DESCS:
+        for desc_tbl, idx in VERIFIED_DESCS[gc].items():
+            if desc_tbl not in found and idx in text_tables and isinstance(text_tables[idx], list):
+                text_tables[desc_tbl] = text_tables[idx]
+                found[desc_tbl] = idx
+
+    # Pass 6: pokedex flavor — near species table, much longer entries (full dex descriptions)
+    if 'species' in found and 'pokedex_flavor' not in found:
+        sp_idx = found['species']
+        sp_count = len(text_tables['species'])
+        for offset in range(-5, 6):
+            if offset == 0:
+                continue
+            candidate = sp_idx + offset
+            if candidate in text_tables and isinstance(text_tables[candidate], list) and candidate not in found.values():
+                entries = text_tables[candidate]
+                if abs(len(entries) - sp_count) < 10:
+                    avg_len = sum(len(s) for s in entries[:20]) / max(1, min(20, len(entries)))
+                    if avg_len > 30:  # dex entries are much longer than species names
+                        text_tables['pokedex_flavor'] = entries
+                        found['pokedex_flavor'] = candidate
+                        break
 
     return found
 
@@ -1089,19 +1300,19 @@ _GEN4_KATAKANA = {
 
 # Fullwidth numbers and letters (0x00A2-0x00DF)
 _GEN4_FULLWIDTH = {
-    0x00A2: '０', 0x00A3: '１', 0x00A4: '２', 0x00A5: '３', 0x00A6: '４',
-    0x00A7: '５', 0x00A8: '６', 0x00A9: '７', 0x00AA: '８', 0x00AB: '９',
-    0x00AC: 'Ａ', 0x00AD: 'Ｂ', 0x00AE: 'Ｃ', 0x00AF: 'Ｄ', 0x00B0: 'Ｅ',
-    0x00B1: 'Ｆ', 0x00B2: 'Ｇ', 0x00B3: 'Ｈ', 0x00B4: 'Ｉ', 0x00B5: 'Ｊ',
-    0x00B6: 'Ｋ', 0x00B7: 'Ｌ', 0x00B8: 'Ｍ', 0x00B9: 'Ｎ', 0x00BA: 'Ｏ',
-    0x00BB: 'Ｐ', 0x00BC: 'Ｑ', 0x00BD: 'Ｒ', 0x00BE: 'Ｓ', 0x00BF: 'Ｔ',
-    0x00C0: 'Ｕ', 0x00C1: 'Ｖ', 0x00C2: 'Ｗ', 0x00C3: 'Ｘ', 0x00C4: 'Ｙ',
-    0x00C5: 'Ｚ', 0x00C6: 'ａ', 0x00C7: 'ｂ', 0x00C8: 'ｃ', 0x00C9: 'ｄ',
-    0x00CA: 'ｅ', 0x00CB: 'ｆ', 0x00CC: 'ｇ', 0x00CD: 'ｈ', 0x00CE: 'ｉ',
-    0x00CF: 'ｊ', 0x00D0: 'ｋ', 0x00D1: 'ｌ', 0x00D2: 'ｍ', 0x00D3: 'ｎ',
-    0x00D4: 'ｏ', 0x00D5: 'ｐ', 0x00D6: 'ｑ', 0x00D7: 'ｒ', 0x00D8: 'ｓ',
-    0x00D9: 'ｔ', 0x00DA: 'ｕ', 0x00DB: 'ｖ', 0x00DC: 'ｗ', 0x00DD: 'ｘ',
-    0x00DE: 'ｙ', 0x00DF: 'ｚ',
+    0x00A2: '0', 0x00A3: '1', 0x00A4: '2', 0x00A5: '3', 0x00A6: '4',
+    0x00A7: '5', 0x00A8: '6', 0x00A9: '7', 0x00AA: '8', 0x00AB: '9',
+    0x00AC: 'A', 0x00AD: 'B', 0x00AE: 'C', 0x00AF: 'D', 0x00B0: 'E',
+    0x00B1: 'F', 0x00B2: 'G', 0x00B3: 'H', 0x00B4: 'I', 0x00B5: 'J',
+    0x00B6: 'K', 0x00B7: 'L', 0x00B8: 'M', 0x00B9: 'N', 0x00BA: 'O',
+    0x00BB: 'P', 0x00BC: 'Q', 0x00BD: 'R', 0x00BE: 'S', 0x00BF: 'T',
+    0x00C0: 'U', 0x00C1: 'V', 0x00C2: 'W', 0x00C3: 'X', 0x00C4: 'Y',
+    0x00C5: 'Z', 0x00C6: 'a', 0x00C7: 'b', 0x00C8: 'c', 0x00C9: 'd',
+    0x00CA: 'e', 0x00CB: 'f', 0x00CC: 'g', 0x00CD: 'h', 0x00CE: 'i',
+    0x00CF: 'j', 0x00D0: 'k', 0x00D1: 'l', 0x00D2: 'm', 0x00D3: 'n',
+    0x00D4: 'o', 0x00D5: 'p', 0x00D6: 'q', 0x00D7: 'r', 0x00D8: 's',
+    0x00D9: 't', 0x00DA: 'u', 0x00DB: 'v', 0x00DC: 'w', 0x00DD: 'x',
+    0x00DE: 'y', 0x00DF: 'z',
 }
 
 # Fullwidth symbols (0x00E0-0x011F)
@@ -1236,31 +1447,29 @@ def decode_gen4_text(data: bytes) -> list:
             key = (key + 0x493D) & 0xFFFF
             vals.append(dec)
 
-        # Check for 0xF100 compressed text (9-bit encoding)
+        # Check for 0xF100 compressed text (trainer names)
+        # Algorithm from pret decomp (String_ConcatTrainerName):
+        # Each u16 word contributes only 15 bits. 9-bit chars are extracted
+        # with bit 15 of each word skipped (shift threshold is 15, not 16).
         if vals and vals[0] == 0xF100:
-            bits = 0
-            nbits = 0
-            raw_u16s = []
-            for w in vals[1:]:
-                if w == 0xFFFF:
-                    break
-                raw_u16s.append(w)
-                bits |= (w << nbits)
-                nbits += 16
+            src = vals[1:]  # skip the 0xF100 marker
             chars = []
-            raw_9bit = []
-            while nbits >= 9:
-                c = bits & 0x1FF
-                bits >>= 9
-                nbits -= 9
-                if c == 0x1FF:
+            si = 0   # source word index
+            shift = 0
+            while si < len(src):
+                # Extract 9-bit character spanning current word (and possibly next)
+                cur_char = (src[si] >> shift) & 0x1FF
+                shift += 9
+                if shift >= 15:
+                    si += 1
+                    shift -= 15
+                    if shift and si < len(src):
+                        cur_char |= (src[si] << (9 - shift)) & 0x1FF
+                if cur_char == 0x1FF:  # compressed EOS
                     break
-                raw_9bit.append(c)
-                # Map 9-bit index through ARM9 lookup table, then to character
-                mapped = f100_table[c] if f100_table and c < len(f100_table) else c
-                ch = _get_gen4_char(mapped)
+                ch = _get_gen4_char(cur_char)
                 if ch == '?':
-                    chars.append(f'\\x{mapped:04X}')
+                    chars.append(f'\\x{cur_char:04X}')
                 else:
                     chars.append(ch)
             strings.append(''.join(chars))
@@ -1330,14 +1539,249 @@ def decode_ai_flags(flags: int, gen: int = 5) -> list:
     return active_flags if active_flags else ["None"]
 
 
+# BW2 Challenge Mode runtime level delta table.
+# Verified by measuring stored trpoke levels vs actual in-game levels.
+# The game applies a flat per-trainer-file delta at runtime on top of stored levels.
+# Pattern: +1 per pair of gyms, capped at +4 from gym 7 onward (E4, Champion included).
+# Keyed by trdata/trpoke file index -> challenge delta.
+# Normal mode files and unkeyed files get delta 0.
+_BW2_CHALLENGE_FILE_DELTA = {
+    # Gym 1 - Cheren (Aspertia)
+    764: 1,
+    # Gym 2 - Roxie (Virbank)
+    765: 1,
+    # Gym 3 - Burgh (Castelia)
+    766: 2,
+    # Gym 4 - Elesa (Nimbasa)
+    767: 2,
+    # Gym 5 - Clay (Driftveil)
+    768: 3,
+    # Gym 6 - Skyla (Mistralton)
+    769: 3,
+    # Gym 7 - Drayden (Opelucid)
+    770: 4,
+    # Gym 8 - Marlon (Humilau)
+    771: 4,
+    # Elite Four - Shauntal, Caitlin, Grimsley, Marshal (pre-champion)
+    772: 4, 773: 4, 774: 4, 775: 4,
+    # Champion Iris (pre-champion)
+    776: 4,
+    # Elite Four rematches (post-game)
+    777: 4, 778: 4, 779: 4, 780: 4,
+    # Champion Iris rematch
+    781: 4,
+}
+
+def get_bw2_challenge_delta(file_idx: int, game_code: str = '') -> int:
+    """Get runtime challenge level delta for a BW2 trainer file.
+    Returns 0 for Normal mode files, non-BW2 games, or unkeyed files.
+    """
+    if game_code not in ('IRE', 'IRD'):
+        return 0
+    return _BW2_CHALLENGE_FILE_DELTA.get(file_idx, 0)
+
+
 # TRPoke template sizes (keyed by template bits from TRData byte 0)
 # bit 0 = has custom moves, bit 1 = has held item
-TRPOKE_FORMATS = {
-    0: 8,   # iv(1) ability(1) level(1) pad(1) species(2) form(2)
-    1: 16,  # + move1(2) move2(2) move3(2) move4(2)
+# Gen V: iv(u8) ability(u8) level(u8) pad(u8) species(u16) form(u16) = 8B base
+TRPOKE_FORMATS_G5 = {
+    0: 8,   # base
+    1: 16,  # + moves(8)
     2: 10,  # + item(2)
     3: 18,  # + item(2) + moves(8)
 }
+# Gen IV: iv(u16) level(u16) species(u16) = 6B base
+TRPOKE_FORMATS_G4 = {
+    0: 6,   # base
+    1: 14,  # + moves(8)
+    2: 8,   # + item(2)
+    3: 18,  # + item(2) + moves(8) + pad(2)
+}
+
+# =============================================================================
+# TRAINER LOCATION MAPPING
+# Maps special trainers (Gym Leaders, E4, Champions) to their battle locations.
+# =============================================================================
+
+TRAINER_LOCATIONS = {
+    # Gen IV - Diamond/Pearl
+    "ADA": {
+        ("Leader", "Roark"): "Oreburgh Gym",
+        ("Leader", "Gardenia"): "Eterna Gym",
+        ("Leader", "Maylene"): "Veilstone Gym",
+        ("Leader", "Crasher Wake"): "Pastoria Gym",
+        ("Leader", "Wake"): "Pastoria Gym",
+        ("Leader", "Fantina"): "Hearthome Gym",
+        ("Leader", "Byron"): "Canalave Gym",
+        ("Leader", "Candice"): "Snowpoint Gym",
+        ("Leader", "Volkner"): "Sunyshore Gym",
+        ("Elite Four", "Aaron"): "Pokémon League",
+        ("Elite Four", "Bertha"): "Pokémon League",
+        ("Elite Four", "Flint"): "Pokémon League",
+        ("Elite Four", "Lucian"): "Pokémon League",
+        ("Champion", "Cynthia"): "Pokémon League",
+    },
+    "APA": "ADA",  # Pearl alias
+    
+    # Gen IV - Platinum
+    "CPU": {
+        ("Leader", "Roark"): "Oreburgh Gym",
+        ("Leader", "Gardenia"): "Eterna Gym",
+        ("Leader", "Fantina"): "Hearthome Gym",
+        ("Leader", "Maylene"): "Veilstone Gym",
+        ("Leader", "Crasher Wake"): "Pastoria Gym",
+        ("Leader", "Wake"): "Pastoria Gym",
+        ("Leader", "Byron"): "Canalave Gym",
+        ("Leader", "Candice"): "Snowpoint Gym",
+        ("Leader", "Volkner"): "Sunyshore Gym",
+        ("Elite Four", "Aaron"): "Pokémon League",
+        ("Elite Four", "Bertha"): "Pokémon League",
+        ("Elite Four", "Flint"): "Pokémon League",
+        ("Elite Four", "Lucian"): "Pokémon League",
+        ("Champion", "Cynthia"): "Pokémon League",
+        ("Tower Tycoon", "Palmer"): "Battle Tower",
+    },
+    
+    # Gen IV - HeartGold/SoulSilver
+    "IPK": {
+        # Johto Gym Leaders
+        ("Leader", "Falkner"): "Violet Gym",
+        ("Leader", "Bugsy"): "Azalea Gym",
+        ("Leader", "Whitney"): "Goldenrod Gym",
+        ("Leader", "Morty"): "Ecruteak Gym",
+        ("Leader", "Chuck"): "Cianwood Gym",
+        ("Leader", "Jasmine"): "Olivine Gym",
+        ("Leader", "Pryce"): "Mahogany Gym",
+        ("Leader", "Clair"): "Blackthorn Gym",
+        # Kanto Gym Leaders (class = name in HGSS)
+        ("Leader", "Brock"): "Pewter Gym",
+        ("Leader", "Misty"): "Cerulean Gym",
+        ("Leader", "Lt. Surge"): "Vermilion Gym",
+        ("Leader", "Erika"): "Celadon Gym",
+        ("Leader", "Janine"): "Fuchsia Gym",
+        ("Leader", "Sabrina"): "Saffron Gym",
+        ("Leader", "Blaine"): "Seafoam Gym",
+        ("Leader", "Blue"): "Viridian Gym",
+        # Elite Four & Champion
+        ("Elite Four", "Will"): "Indigo Plateau",
+        ("Elite Four", "Koga"): "Indigo Plateau",
+        ("Elite Four", "Bruno"): "Indigo Plateau",
+        ("Elite Four", "Karen"): "Indigo Plateau",
+        ("Champion", "Lance"): "Indigo Plateau",
+        # Special
+        ("PKMN Trainer", "Red"): "Mt. Silver (Summit)",
+    },
+    "IPG": "IPK",  # SoulSilver alias
+    
+    # Gen V - Black/White
+    "IRB": {
+        ("Leader", "Cilan"): "Striaton Gym",
+        ("Leader", "Chili"): "Striaton Gym",
+        ("Leader", "Cress"): "Striaton Gym",
+        ("Leader", "Lenora"): "Nacrene Gym",
+        ("Leader", "Burgh"): "Castelia Gym",
+        ("Leader", "Elesa"): "Nimbasa Gym",
+        ("Leader", "Clay"): "Driftveil Gym",
+        ("Leader", "Skyla"): "Mistralton Gym",
+        ("Leader", "Brycen"): "Icirrus Gym",
+        ("Leader", "Drayden"): "Opelucid Gym",
+        ("Leader", "Iris"): "Opelucid Gym",
+        ("Elite Four", "Shauntal"): "Pokémon League",
+        ("Elite Four", "Grimsley"): "Pokémon League",
+        ("Elite Four", "Caitlin"): "Pokémon League",
+        ("Elite Four", "Marshal"): "Pokémon League",
+        ("Champion", "Alder"): "Pokémon League",
+        ("PKMN Trainer", "N"): "N's Castle",
+        ("Subway Boss", "Ingo"): "Battle Subway",
+        ("Subway Boss", "Emmet"): "Battle Subway",
+    },
+    "IRA": "IRB",  # White alias
+    
+    # Gen V - Black 2/White 2
+    "IRE": {
+        ("Leader", "Cheren"): "Aspertia Gym",
+        ("Leader", "Roxie"): "Virbank Gym",
+        ("Leader", "Burgh"): "Castelia Gym",
+        ("Leader", "Elesa"): "Nimbasa Gym",
+        ("Leader", "Clay"): "Driftveil Gym",
+        ("Leader", "Skyla"): "Mistralton Gym",
+        ("Leader", "Drayden"): "Opelucid Gym",
+        ("Leader", "Marlon"): "Humilau Gym",
+        ("Elite Four", "Shauntal"): "Pokémon League",
+        ("Elite Four", "Grimsley"): "Pokémon League",
+        ("Elite Four", "Caitlin"): "Pokémon League",
+        ("Elite Four", "Marshal"): "Pokémon League",
+        ("Champion", "Iris"): "Pokémon League",
+        ("Subway Boss", "Ingo"): "Battle Subway",
+        ("Subway Boss", "Emmet"): "Battle Subway",
+    },
+    "IRD": "IRE",  # White 2 alias
+}
+
+# Class-only location mappings (fallback when name not found)
+CLASS_LOCATIONS = {
+    "ADA": {"Elite Four": "Pokémon League", "Champion": "Pokémon League"},
+    "APA": "ADA",
+    "CPU": {"Elite Four": "Pokémon League", "Champion": "Pokémon League", "Tower Tycoon": "Battle Tower"},
+    "IPK": {"Elite Four": "Indigo Plateau", "Champion": "Indigo Plateau",
+            "Brock": "Pewter Gym", "Misty": "Cerulean Gym", "Lt. Surge": "Vermilion Gym",
+            "Erika": "Celadon Gym", "Janine": "Fuchsia Gym", "Sabrina": "Saffron Gym",
+            "Blaine": "Seafoam Gym", "Blue": "Viridian Gym"},
+    "IPG": "IPK",
+    "IRB": {"Elite Four": "Pokémon League", "Champion": "Pokémon League", "Subway Boss": "Battle Subway"},
+    "IRA": "IRB",
+    "IRE": {
+        "Elite Four": "Pokémon League", "Champion": "Pokémon League", "Subway Boss": "Battle Subway",
+        # PWT participants (class = name)
+        "Brock": "Pokémon World Tournament", "Misty": "Pokémon World Tournament",
+        "Lt. Surge": "Pokémon World Tournament", "Erika": "Pokémon World Tournament",
+        "Sabrina": "Pokémon World Tournament", "Blaine": "Pokémon World Tournament",
+        "Giovanni": "Pokémon World Tournament", "Falkner": "Pokémon World Tournament",
+        "Bugsy": "Pokémon World Tournament", "Whitney": "Pokémon World Tournament",
+        "Morty": "Pokémon World Tournament", "Chuck": "Pokémon World Tournament",
+        "Jasmine": "Pokémon World Tournament", "Pryce": "Pokémon World Tournament",
+        "Clair": "Pokémon World Tournament", "Janine": "Pokémon World Tournament",
+        "Roxanne": "Pokémon World Tournament", "Brawly": "Pokémon World Tournament",
+        "Wattson": "Pokémon World Tournament", "Flannery": "Pokémon World Tournament",
+        "Norman": "Pokémon World Tournament", "Winona": "Pokémon World Tournament",
+        "Tate": "Pokémon World Tournament", "Liza": "Pokémon World Tournament",
+        "Juan": "Pokémon World Tournament", "Roark": "Pokémon World Tournament",
+        "Gardenia": "Pokémon World Tournament", "Fantina": "Pokémon World Tournament",
+        "Maylene": "Pokémon World Tournament", "Wake": "Pokémon World Tournament",
+        "Byron": "Pokémon World Tournament", "Candice": "Pokémon World Tournament",
+        "Volkner": "Pokémon World Tournament", "Blue": "Pokémon World Tournament",
+        "Lance": "Pokémon World Tournament", "Steven": "Pokémon World Tournament",
+        "Wallace": "Pokémon World Tournament", "Red": "Pokémon World Tournament",
+        "Cynthia": "Pokémon World Tournament", "Alder": "Pokémon World Tournament",
+    },
+    "IRD": "IRE",
+}
+
+
+def get_trainer_location(game_code: str, class_name: str, trainer_name: str):
+    """Look up location for special trainers (Gym Leaders, E4, Champions, etc.)."""
+    # Resolve alias
+    mapping = TRAINER_LOCATIONS.get(game_code)
+    if isinstance(mapping, str):
+        mapping = TRAINER_LOCATIONS.get(mapping, {})
+    if not mapping:
+        return None
+    
+    # Try (class, name) first
+    location = mapping.get((class_name, trainer_name))
+    if location:
+        return location
+    
+    # Try CLASS_LOCATIONS fallback
+    class_map = CLASS_LOCATIONS.get(game_code)
+    if isinstance(class_map, str):
+        class_map = CLASS_LOCATIONS.get(class_map, {})
+    if class_map:
+        return class_map.get(class_name)
+    
+    return None
+
+
 
 
 def get_text(key, entry_index: int = None):
@@ -1441,7 +1885,11 @@ def bootstrap_text_tables(rom, game_code: str) -> dict:
         result["_warning"] = "Could not find species table"
 
     if found:
-        result["detected"] = found
+        detected_rich = {}
+        for tname, fidx in found.items():
+            count = len(text_tables.get(tname, []))
+            detected_rich[tname] = f"{text_narc_path}:{fidx} ({count} entries)"
+        result["detected"] = detected_rich
 
     return result
 
@@ -1511,103 +1959,6 @@ def _discover_tm_table():
 
     return len(tm_table)
 
-
-def _discover_f100_table():
-    """Search ARM9 (and overlays) for the 512-entry F100 compression lookup table.
-    Gen IV trainer names are UPPERCASE, so 'SILVER' 9-bit values map to uppercase Gen4 codes.
-    Known: index 0x13D → 0x013D (S). We search for a table with this identity mapping
-    and verify surrounding entries form a sequential A-Z block.
-    """
-    global f100_table
-    f100_table = None
-    if not current_rom or current_rom['type'] != 'nds':
-        return None
-    if (text_gen or 5) != 4:
-        return None
-
-    def _search_data(data):
-        """Search a binary blob for the F100 table. Returns list of 512 u16 or None."""
-        # Strategy: S (Gen4 0x13D) is at 9-bit index 0x13D (identity mapping).
-        # In the table, at offset 0x13D*2 = 0x27A, we expect bytes 3D 01.
-        # Nearby, T (0x13E) at offset 0x27C should be 3E 01.
-        # The A-Z block (0x12B-0x144) should be contiguous starting at index 0x12B.
-        needle = struct.pack('<HH', 0x013D, 0x013E)  # S, T consecutive
-        pos = 0
-        while True:
-            pos = data.find(needle, pos)
-            if pos < 0:
-                break
-            # S is at index 0x13D, so table_start = pos - 0x13D*2
-            table_start = pos - 0x13D * 2
-            if table_start < 0 or table_start + 1024 > len(data):
-                pos += 1
-                continue
-            # Verify: A-Z block at indices 0x12B-0x144 should be 0x012B-0x0144
-            ok = True
-            for i in range(26):
-                off = table_start + (0x12B + i) * 2
-                val = struct.unpack_from('<H', data, off)[0]
-                if val != 0x012B + i:
-                    ok = False
-                    break
-            if not ok:
-                pos += 1
-                continue
-            # Verify: a-z block at indices 0x145-0x15E should be 0x0145-0x015E
-            for i in range(26):
-                off = table_start + (0x145 + i) * 2
-                val = struct.unpack_from('<H', data, off)[0]
-                if val != 0x0145 + i:
-                    ok = False
-                    break
-            if not ok:
-                pos += 1
-                continue
-            # Reject tables where low entries (0x00-0x13) are all zero —
-            # HeartGold has two tables in ARM9, the first is zero-padded and wrong.
-            nonzero = sum(
-                1 for i in range(20)
-                if struct.unpack_from('<H', data, table_start + i * 2)[0] != 0
-            )
-            if nonzero < 3:
-                pos += 1
-                continue
-            # Found! Read all 512 entries
-            table = []
-            for i in range(512):
-                off = table_start + i * 2
-                table.append(struct.unpack_from('<H', data, off)[0])
-            return table
-            pos += 1
-        return None
-
-    # Search ARM9 first
-    arm9 = bytes(current_rom['arm9_data'])
-    result = _search_data(arm9)
-    if result:
-        f100_table = result
-        return 512
-
-    # Search overlays
-    rom = current_rom['rom']
-    try:
-        for ov in rom.arm9OverlayTable:
-            try:
-                ov_data = bytes(rom.files[ov.fileID])
-                # Try decompressing if compressed
-                try:
-                    ov_data = bytes(ndspy.lz10.decompress(ov_data))
-                except:
-                    pass
-                result = _search_data(ov_data)
-                if result:
-                    f100_table = result
-                    return 512
-            except:
-                continue
-    except:
-        pass
-    return None
 
 
 EV_STAT_BITS = ['HP', 'Atk', 'Def', 'Spe', 'SpA', 'SpD']  # bit 0-5
@@ -1684,9 +2035,14 @@ def decode_gender(gender_byte: int, species_id: int) -> str:
 
 
 def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
-    """Decode a TRPoke file into human-readable format using text_tables."""
+    """Decode a TRPoke file into human-readable format using text_tables.
+    Gen IV: iv(u16) level(u16) species(u16) = 6B base.
+    Gen V: iv(u8) ability(u8) level(u8) pad(u8) species(u16) form(u16) = 8B base."""
     if len(data) == 0:
         return {"pokemon": []}
+
+    gen = text_gen or 5
+    formats = TRPOKE_FORMATS_G4 if gen <= 4 else TRPOKE_FORMATS_G5
 
     # Determine template from TRData byte 0 if available
     template = 0
@@ -1695,11 +2051,11 @@ def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
     else:
         # Guess from file size
         for t in [3, 2, 1, 0]:
-            if len(data) % TRPOKE_FORMATS[t] == 0 and len(data) // TRPOKE_FORMATS[t] > 0:
+            if len(data) % formats[t] == 0 and len(data) // formats[t] > 0:
                 template = t
                 break
 
-    pokemon_size = TRPOKE_FORMATS.get(template, 8)
+    pokemon_size = formats.get(template, formats[0])
     num_pokemon = len(data) // pokemon_size
 
     species_list = text_tables.get('species', [])
@@ -1712,42 +2068,54 @@ def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
         if off + pokemon_size > len(data):
             break
 
-        difficulty = data[off]
-        ability_gender = data[off + 1]
-        level = data[off + 2]
-        species_id = struct.unpack_from('<H', data, off + 4)[0]
-        form = struct.unpack_from('<H', data, off + 6)[0]
+        if gen <= 4:
+            # Gen IV layout: iv(u16) level(u16) species(u16)
+            iv_raw = struct.unpack_from('<H', data, off)[0]
+            level = struct.unpack_from('<H', data, off + 2)[0]
+            species_id = struct.unpack_from('<H', data, off + 4)[0]
+            species_name = species_list[species_id] if species_id < len(species_list) else f"#{species_id}"
+            ivs = iv_raw * 31 // 255 if iv_raw <= 255 else 31
+            base_size = 6
 
-        ability_slot = (ability_gender >> 4) & 0xF
-        gender_byte = ability_gender & 0xF
-        species_name = species_list[species_id] if species_id < len(species_list) else f"#{species_id}"
-        
-        # Get actual ability name
-        ability_name = get_ability_from_personal(species_id, ability_slot)
-        
-        # Decode gender
-        gender = decode_gender(gender_byte, species_id)
-        
-        # Decode IVs
-        ivs = decode_trainer_iv(difficulty)
+            entry = {
+                "species": species_name,
+                "species_id": species_id,
+                "level": level,
+                "ivs": ivs,
+            }
+        else:
+            # Gen V layout: iv(u8) ability(u8) level(u8) pad(u8) species(u16) form(u16)
+            difficulty = data[off]
+            ability_gender = data[off + 1]
+            level = data[off + 2]
+            species_id = struct.unpack_from('<H', data, off + 4)[0]
+            form = struct.unpack_from('<H', data, off + 6)[0]
 
-        entry = {
-            "species": species_name,
-            "species_id": species_id,
-            "level": level,
-            "ability": ability_name,
-            "gender": gender,
-            "ivs": ivs,
-            "form": form,
-        }
+            ability_slot = (ability_gender >> 4) & 0xF
+            gender_byte = ability_gender & 0xF
+            species_name = species_list[species_id] if species_id < len(species_list) else f"#{species_id}"
+            ability_name = get_ability_from_personal(species_id, ability_slot)
+            gender = decode_gender(gender_byte, species_id)
+            ivs = decode_trainer_iv(difficulty)
+            base_size = 8
+
+            entry = {
+                "species": species_name,
+                "species_id": species_id,
+                "level": level,
+                "ability": ability_name,
+                "gender": gender,
+                "ivs": ivs,
+                "form": form,
+            }
 
         if template & 2:  # Has held item
-            item_id = struct.unpack_from('<H', data, off + 8)[0]
+            item_id = struct.unpack_from('<H', data, off + base_size)[0]
             item_name = items_list[item_id] if item_id < len(items_list) else f"item#{item_id}"
             entry["held_item"] = item_name if item_id > 0 else "None"
 
         if template & 1:  # Has moves
-            move_off = off + 8 + (2 if template & 2 else 0)
+            move_off = off + base_size + (2 if template & 2 else 0)
             moves = []
             for m in range(4):
                 mid = struct.unpack_from('<H', data, move_off + m * 2)[0]
@@ -1805,12 +2173,106 @@ def decode_trdata(data: bytes, index: int = None) -> dict:
         "raw": data.hex(),
     }
 
-    if index is not None and index < len(trainer_names):
-        result["name"] = trainer_names[index]
+    # Class-based canonical name injection for player-named rivals only.
+    # These trainers have no real entry in trainer_names — the game replaces
+    # their name at runtime with whatever the player chose.
+    # Gym leaders, Red, etc. now resolve correctly via trainer_names (file 729
+    # in HGSS) after the dual-file fingerprinting fix (Pass 3b).
+    RIVAL_CLASS_NAMES_G4 = {
+        # Player-named rivals — no canonical name in trainer_names
+        23:  "Silver",  # HGSS rival
+        95:  "Barry",   # DP/Pt vs male player
+        96:  "Barry",   # DP/Pt vs female player
+    }
+    if gen == 4 and trainer_class in RIVAL_CLASS_NAMES_G4:
+        result["name"] = RIVAL_CLASS_NAMES_G4[trainer_class]
+    elif index is not None and index < len(trainer_names):
+        name = trainer_names[index].strip()
+        if name:
+            result["name"] = name
+
+    # Gen V BW2 -- Hugh (class 145 = blank " Trainer"):
+    # Stored as "Rival" placeholder in trainer_names (runtime-replaced by player's chosen name).
+    # 3 trdata files per story encounter = one per starter counter (Snivy/Tepig/Oshawott).
+    # 6 files = 3 starters x 2 player genders (Nate vs Hugh / Rosa vs Hugh).
+    if gen == 5 and result.get("name") == "Rival" and trainer_class == 145:
+        result["name"] = "Hugh"
+        result["name_note"] = (
+            "Default English name (player can rename at game start). "
+            "Stored as 'Rival' placeholder in trainer_names. "
+            "3 trdata files per story encounter = one per starter counter; "
+            "6 files = 3 starters x 2 player genders (Nate/Rosa)."
+        )
 
     return result
 
 
+
+
+def _role_path(role_name):
+    """Look up a NARC path by its role name, using the narc_roles reverse map."""
+    for path, role in narc_roles.items():
+        if role == role_name:
+            return path
+    return None
+
+
+def _resolve_pwt_trainer_name(trainer_idx, trainer_role="pwt_trainers"):
+    """Resolve a PWT trainer index to a name via the trainer mapping table (a/2/4/0).
+    Entry stride: 20 bytes (10 u16s). Class IDs live at different positions per group:
+      - Group 1 (Kanto/Johto): u16[8] has the class ID
+      - Groups 2-5 (Hoenn/Sinnoh/Unova/Champions): u16[5], u16[6], u16[7] have class IDs
+    Check all candidate positions, return the first that resolves to a real leader name."""
+    _JUNK = {'Pokmon Trainer', 'Boss Trainer', 'no data', 'Pokmon Trainer',
+             'Team Plasma', 'GAME FREAK', 'Leader', ''}
+    classes = text_tables.get('trainer_classes', [])
+    try:
+        map_path = _role_path('pwt_trainer_map')
+        if not map_path:
+            return None
+        map_narc = _get_narc(map_path)
+        if not map_narc.files:
+            return None
+        data = bytes(map_narc.files[0])
+        stride = 20
+        entry_off = trainer_idx * stride
+        if entry_off + stride > len(data):
+            return None
+        # Check u16[8] first (works for group 1), then u16[5], u16[6], u16[7]
+        for pos in (8, 5, 6, 7):
+            cid = struct.unpack_from('<H', data, entry_off + pos * 2)[0]
+            if cid == 0 or cid >= len(classes):
+                continue
+            raw = classes[cid]
+            if isinstance(raw, str):
+                clean = re.sub(r'[^\x20-\x7E]', '', raw).strip()
+                if clean and clean not in _JUNK:
+                    return clean
+    except:
+        pass
+    return None
+
+
+# PWT pool roles — these decode as individual pokemon entries (16B each)
+_PWT_POOL_ROLES = {
+    'pwt_rental', 'pwt_rental_b', 'pwt_champions', 'pwt_champions_b', 'pwt_mix',
+}
+
+# PWT role relationships: trainer role → (roster role, pool role)
+_PWT_ROLE_CHAINS = {
+    'pwt_trainers':   ('pwt_rosters',   'pwt_rental'),
+    'pwt_trainers_b': ('pwt_rosters_b', 'pwt_champions'),
+    'pwt_trainers_2': ('pwt_rosters_2', 'pwt_rental'),
+}
+
+# Roster role → pool role (includes non-PWT facilities that share the format)
+_PWT_ROSTER_POOLS = {
+    'pwt_rosters':           'pwt_rental',
+    'pwt_rosters_b':         'pwt_champions',
+    'pwt_rosters_2':         'pwt_rental',
+    'subway_trainers':       'subway_pokemon',
+    'battle_tower_trainers': 'battle_tower_pokemon',
+}
 
 
 def decode_pwt(data: bytes, is_champions: bool = False, pool_name: str = "", pool_index: int = 0):
@@ -1822,7 +2284,6 @@ def decode_pwt(data: bytes, is_champions: bool = False, pool_name: str = "", poo
     moves_list = text_tables.get('moves', [])
     natures_list = text_tables.get('natures', [])
     items_list = text_tables.get('items', [])
-    classes_list = text_tables.get('trainer_classes', [])
 
     species_id = struct.unpack_from('<H', data, 0)[0]
     moves = [struct.unpack_from('<H', data, 2 + i * 2)[0] for i in range(4)]
@@ -1834,33 +2295,45 @@ def decode_pwt(data: bytes, is_champions: bool = False, pool_name: str = "", poo
     nature_raw = natures_list[nature] if nature < len(natures_list) else ""
     nature_name = re.sub(r'[^\x20-\x7E]', '', nature_raw).replace(' nature.', '').strip() if nature_raw else f"nature#{nature}"
 
-    move_names = []
-    for mid in moves:
-        if mid == 0:
-            continue
-        elif mid < len(moves_list):
-            move_names.append(moves_list[mid])
-        else:
-            move_names.append(f"move#{mid}")
-
+    move_names = [moves_list[m] if m < len(moves_list) else f"move#{m}" for m in moves if m != 0]
     ev_names = decode_ev_spread(ev_spread)
 
-    header = f"{species_name} | {nature_name}"
-    if is_champions and field12 > 0:
+    item_tag = ""
+    if field12 > 0:
         item_name = items_list[field12] if field12 < len(items_list) else f"item#{field12}"
-        header += f"  [{item_name}]"
+        item_tag = f"  [{item_name}]"
 
-    lines = [header]
+    poke_line = f"{species_name} ({nature_name}){item_tag}"
+    out = [f"[{pool_name} #{pool_index}] {poke_line}" if pool_name else poke_line]
     if move_names:
-        lines.append(" / ".join(move_names))
-    lines.append(f"EVs: {', '.join(ev_names)}")
-    if pool_name:
-        lines[0] = f"[{pool_name} #{pool_index}] " + lines[0]
-    return "\n".join(lines)
+        out.append(" / ".join(move_names))
+    if ev_names and ev_names != ['None']:
+        out.append(f"EVs: {', '.join(ev_names)}")
+
+    return "\n".join(out)
 
 
-def decode_pwt_roster(data: bytes, slot_index: int = 0, pool_name: str = ""):
-    """Decode PWT/facility roster. Returns positional text."""
+def _resolve_pwt_pool_entry(pool_idx, pool_narc_path=None, pool_role='pwt_champions'):
+    """Resolve a PWT pool index to a single formatted pokemon line."""
+    try:
+        if not pool_narc_path:
+            pool_narc_path = _role_path(pool_role)
+        if not pool_narc_path:
+            return None
+        pool_narc = _get_narc(pool_narc_path)
+        if pool_idx >= len(pool_narc.files):
+            return None
+        pdata = bytes(pool_narc.files[pool_idx])
+        result = decode_pwt(pdata)
+        if not result:
+            return None
+        return result.replace("\n", "  |  ")
+    except:
+        return None
+
+
+def decode_pwt_roster(data: bytes, slot_index: int = 0, roster_role: str = "pwt_rosters"):
+    """Decode PWT/facility roster with resolved pokemon. Returns positional text."""
     if len(data) < 4:
         return None
     fmt = struct.unpack_from('<H', data, 0)[0]
@@ -1872,13 +2345,22 @@ def decode_pwt_roster(data: bytes, slot_index: int = 0, pool_name: str = ""):
         off = 4 + i * 2
         if off + 2 > len(data):
             break
-        indices.append(str(struct.unpack_from('<H', data, off)[0]))
-    header = f"{pool_name} " if pool_name else ""
-    return f"{header}Roster #{slot_index} | {count} Pokémon\nPool: {', '.join(indices)}"
+        indices.append(struct.unpack_from('<H', data, off)[0])
+    label = roster_role.replace('pwt_', '').replace('_', ' ').title()
+    out = [f"{label} Roster #{slot_index} | {count} Pokémon"]
+    pool_role = _PWT_ROSTER_POOLS.get(roster_role, 'pwt_rental')
+    pool_path = _role_path(pool_role)
+    for pi in indices:
+        line = _resolve_pwt_pool_entry(pi, pool_narc_path=pool_path)
+        if line:
+            out.append(f"  Pool[{pi}] {line}")
+        else:
+            out.append(f"  Pool[{pi}] (empty)")
+    return "\n".join(out)
 
 
-def decode_pwt_trainer_config(data: bytes, slot_index: int = 0, pool_name: str = ""):
-    """Decode PWT trainer config (6B). Returns positional text."""
+def decode_pwt_trainer_config(data: bytes, slot_index: int = 0, trainer_role: str = "pwt_trainers"):
+    """Decode PWT trainer config (6B) with resolved roster + pokemon. Returns positional text."""
     if len(data) < 6:
         return None
     fmt = struct.unpack_from('<H', data, 0)[0]
@@ -1886,8 +2368,120 @@ def decode_pwt_trainer_config(data: bytes, slot_index: int = 0, pool_name: str =
     start_idx = struct.unpack_from('<H', data, 4)[0]
     if fmt == 0 and count == 0 and start_idx == 0:
         return None
-    header = f"{pool_name} " if pool_name else ""
-    return f"{header}Trainer #{slot_index} | {count} Pokémon | Start: {start_idx}"
+    trainer_name = _resolve_pwt_trainer_name(slot_index, trainer_role)
+    if trainer_name:
+        out = [f"PKMN Trainer {trainer_name} | Picks {count} from pool | Pool start: {start_idx}"]
+    else:
+        label = trainer_role.replace('pwt_', '').replace('_', ' ').title()
+        out = [f"{label} Trainer #{slot_index} | Format: {fmt} | Picks {count} from pool | Pool start: {start_idx}"]
+    # Follow the role chain: trainer role → roster role → pool role
+    chain = _PWT_ROLE_CHAINS.get(trainer_role)
+    if chain:
+        roster_role, pool_role = chain
+        roster_path = _role_path(roster_role)
+        pool_path = _role_path(pool_role)
+        if roster_path and pool_path:
+            try:
+                roster_narc = _get_narc(roster_path)
+                if slot_index < len(roster_narc.files):
+                    rd = bytes(roster_narc.files[slot_index])
+                    if len(rd) >= 4:
+                        r_count = struct.unpack_from('<H', rd, 2)[0]
+                        indices = []
+                        for i in range(r_count):
+                            off = 4 + i * 2
+                            if off + 2 <= len(rd):
+                                indices.append(struct.unpack_from('<H', rd, off)[0])
+                        for pi in indices:
+                            line = _resolve_pwt_pool_entry(pi, pool_narc_path=pool_path)
+                            if line:
+                                out.append(f"  {line}")
+            except:
+                pass
+    return "\n".join(out)
+
+
+def _resolve_pwt_text(tournament_id):
+    """Resolve a PWT tournament ID to its name via the tournament_names text table.
+    Tournament ID (u16 at offset 0x00 of the def) indexes directly into text file 405."""
+    names = text_tables.get('tournament_names', [])
+    if tournament_id < len(names):
+        raw = names[tournament_id]
+        if isinstance(raw, str):
+            clean = re.sub(r'[^\x20-\x7E]', '', raw).strip()
+            if clean and clean != '???':
+                return clean
+    return None
+
+
+def decode_pwt_tournament_def(data: bytes, file_idx: int = 0):
+    """Decode PWT tournament definition (1688B) from pwt_defs. Returns positional text."""
+    if len(data) < 0x60:
+        return None
+    # Header
+    tid = struct.unpack_from('<H', data, 0)[0]
+    category = struct.unpack_from('<H', data, 2)[0]
+    trainer_count = struct.unpack_from('<H', data, 4)[0]
+    battle_format = struct.unpack_from('<H', data, 6)[0]
+    pool_type = struct.unpack_from('<H', data, 8)[0]
+    cfg5 = struct.unpack_from('<H', data, 0x0A)[0]
+    cfg6 = struct.unpack_from('<H', data, 0x0C)[0]
+    cfg7 = struct.unpack_from('<H', data, 0x0E)[0]
+    cfg8 = struct.unpack_from('<H', data, 0x10)[0]
+    flag1 = struct.unpack_from('<H', data, 0x12)[0]
+    flag2 = struct.unpack_from('<H', data, 0x14)[0]
+
+    BATTLE_TYPES = {1: "Single", 2: "Double", 3: "Triple", 4: "Rotation"}
+    bt = BATTLE_TYPES.get(battle_format, f"Type {battle_format}")
+
+    music_a = struct.unpack_from('<H', data, 0x18)[0]
+    music_b = struct.unpack_from('<H', data, 0x1A)[0]
+
+    # Tournament ID indexes directly into the tournament_names text table (file 405)
+    tournament_name = _resolve_pwt_text(tid) or f"Tournament #{tid}"
+
+    out = [f"Tournament #{tid} — {tournament_name}"]
+    out.append(f"Trainers: {trainer_count} | Battle: {bt} | Pool type: {pool_type}")
+    out.append(f"Config: [{cfg5}, {cfg6}, {cfg7}, {cfg8}]")
+    if flag1 != 0xFFFF:
+        flags = [f for f in [flag1, flag2] if f != 0xFFFF]
+        out.append(f"Save flags: {flags}")
+    out.append(f"Music: {music_a} / {music_b}")
+
+    # Scan data regions at known offsets for pwttr indices
+    trainer_indices = set()
+    for region_start, region_end in [(0xA0, 0x130), (0x160, 0x1A8)]:
+        if len(data) < region_end:
+            continue
+        for off in range(region_start, region_end, 2):
+            val = struct.unpack_from('<H', data, off)[0]
+            if 1 <= val <= 68:
+                trainer_indices.add(val)
+
+    if trainer_indices:
+        sorted_idx = sorted(trainer_indices)
+        out.append(f"Trainer pool indices: {sorted_idx}")
+        # Resolve each via role chain
+        roster_path = _role_path('pwt_rosters_b')
+        pool_path = _role_path('pwt_champions')
+        if roster_path and pool_path:
+            try:
+                roster_narc = _get_narc(roster_path)
+                for ti in sorted_idx:
+                    if ti >= len(roster_narc.files):
+                        continue
+                    rd = bytes(roster_narc.files[ti])
+                    if len(rd) >= 6:
+                        r_count = struct.unpack_from('<H', rd, 2)[0]
+                        first_pool = struct.unpack_from('<H', rd, 4)[0]
+                        line = _resolve_pwt_pool_entry(first_pool, pool_narc_path=pool_path)
+                        if line:
+                            species_part = line.split('|')[0].strip()
+                            out.append(f"  pwttr[{ti}]: {species_part}  (+{r_count - 1} more)")
+            except:
+                pass
+
+    return "\n".join(out)
 
 
 EV_YIELD_STATS = ['HP', 'Atk', 'Def', 'Spe', 'SpA', 'SpD']
@@ -2156,6 +2750,314 @@ def decode_encounters(data: bytes) -> dict:
     return None
 
 
+# Encounter NARC file index (a/1/2/7) -> location_names text table index
+# Corrected mapping from script cross-reference against known BW2 location species.
+# Zone header u16[2] stores internal zone IDs, NOT location_names text indices.
+_B2W2_ENC_LOC = {
+    0:6, 1:8, 2:21,                                          # Striaton City, Castelia City, Route 8
+    3:117, 4:118, 5:119,                                     # Aspertia City, Virbank City, Humilau City
+    6:32, 7:32,                                              # Dreamyard
+    8:33, 9:72,                                              # Pinwheel Forest, Lostlorn Forest
+    10:34, 11:34,                                            # Desert Resort
+    12:35, 13:35, 14:35, 15:35, 16:35, 17:35, 18:35, 19:35, # Relic Castle
+    20:37, 21:37, 22:37,                                     # Chargestone Cave
+    23:38, 24:38, 25:38, 26:38,                              # Twist Mountain
+    27:39, 28:39, 29:39, 30:39,                              # Dragonspiral Tower
+    31:134,                                                  # Victory Road (BW2)
+    32:61, 33:61, 34:61, 35:61, 36:61,                      # Giant Chasm
+    37:129, 38:129, 39:129, 40:129, 41:129,                  # Castelia Sewers
+    42:63,                                                   # P2 Laboratory
+    43:71,                                                   # Undella Bay
+    44:130, 45:130,                                          # Floccesy Ranch
+    46:131, 47:131,                                          # Virbank Complex
+    48:132, 49:132, 50:132, 51:132, 52:132, 53:132,         # Reversal Mountain
+    54:132, 55:132, 56:132, 57:132, 58:132, 59:132, 60:132,
+    61:133, 62:133, 63:133, 64:133, 65:133,                  # Strange House
+    66:133, 67:133, 68:133, 69:133, 70:133,
+    71:134, 72:134, 73:134, 74:134, 75:134,                  # Victory Road (BW2)
+    76:134, 77:134, 78:134, 79:134, 80:134,
+    81:136, 82:136, 83:136,                                  # Relic Passage
+    84:137, 85:137, 86:137,                                  # Clay Tunnel
+    87:149, 88:149, 89:149,                                  # Underground Ruins
+    90:150,                                                  # Rock Peak Chamber
+    91:151,                                                  # Iceberg Chamber
+    92:152,                                                  # Iron Chamber
+    93:141, 94:141,                                          # Seaside Cave
+    95:147,                                                  # Nature Preserve
+    96:65, 97:67, 98:68,                                     # Driftveil Drawbridge, Village Bridge, Marvelous Bridge
+    99:14, 100:15, 101:16,                                   # Route 1, Route 2, Route 3
+    102:53, 103:53,                                          # Wellspring Cave
+    104:17, 105:17,                                          # Route 4
+    106:18, 107:19,                                          # Route 5, Route 6
+    108:54, 109:54,                                          # Mistralton Cave
+    110:74,                                                  # Guidance Chamber
+    111:20,                                                  # Route 7
+    112:56, 113:56, 114:56, 115:56,                          # Celestial Tower
+    116:21,                                                  # Route 8
+    117:57,                                                  # Moor of Icirrus
+    118:22,                                                  # Route 9
+    119:24, 120:25, 121:26, 122:27,                          # Route 11, Route 12, Route 13, Route 14
+    123:70,                                                  # Abundant Shrine
+    124:28, 125:29,                                          # Route 15, Route 16
+    126:72,                                                  # Lostlorn Forest
+    127:31,                                                  # Route 18
+    128:124, 129:125,                                        # Route 19, Route 20
+    130:127, 131:128,                                        # Route 22, Route 23
+    132:42,                                                  # Undella Town
+    133:30,                                                  # Route 17
+    134:126,                                                 # Route 21
+}
+
+# Encounter NARC file index (a/1/2/6) -> location_names text table index
+# Corrected mapping from script cross-reference against known BW1 location species.
+_BW1_ENC_LOC = {
+    0:6, 1:8,                                                # Striaton City, Castelia City (surf)
+    2:21,                                                    # Route 8
+    3:32, 4:32,                                              # Dreamyard
+    5:33, 6:33,                                              # Pinwheel Forest
+    7:34, 8:34,                                              # Desert Resort
+    9:35, 10:35, 11:35, 12:35, 13:35, 14:35,                # Relic Castle
+    15:35, 16:35, 17:35, 18:35, 19:35, 20:35,
+    21:35, 22:35, 23:35, 24:35, 25:35, 26:35,
+    27:35, 28:35, 29:35, 30:35, 31:35, 32:35,
+    33:35, 34:35, 35:35, 36:35, 37:35, 38:35, 39:35,
+    40:36,                                                   # Cold Storage
+    41:37, 42:37, 43:37,                                     # Chargestone Cave
+    44:38, 45:38, 46:38, 47:38,                              # Twist Mountain
+    48:20, 49:20,                                            # Route 7
+    50:39, 51:39,                                            # Dragonspiral Tower
+    52:40, 53:40, 54:40, 55:40, 56:40, 57:40,               # Victory Road
+    58:40, 59:40, 60:40, 61:40, 62:40, 63:40,
+    64:40, 65:40, 66:40, 67:40,
+    68:26,                                                   # Route 13
+    69:61, 70:61, 71:61,                                     # Giant Chasm
+    72:63,                                                   # P2 Laboratory
+    73:71,                                                   # Undella Bay
+    74:0, 76:0,                                              # Empty/unused
+    75:67,                                                   # Village Bridge
+    77:14, 78:15, 79:16,                                     # Route 1, Route 2, Route 3
+    80:53, 81:53,                                            # Wellspring Cave
+    82:17,                                                   # Route 4
+    83:18,                                                   # Route 5
+    84:19,                                                   # Route 6
+    85:54, 86:54, 87:54,                                     # Mistralton Cave
+    88:20,                                                   # Route 7
+    89:56, 90:56, 91:56, 92:56,                              # Celestial Tower
+    93:57, 94:57,                                            # Moor of Icirrus
+    95:22,                                                   # Route 9
+    96:59, 97:59, 98:59,                                     # Challenger's Cave
+    99:23, 100:23,                                           # Route 10
+    101:24,                                                  # Route 11
+    102:25,                                                  # Route 12
+    103:26,                                                  # Route 13
+    104:27,                                                  # Route 14
+    105:70,                                                  # Abundant Shrine
+    106:28,                                                  # Route 15
+    107:29,                                                  # Route 16
+    108:72,                                                  # Lostlorn Forest
+    109:31,                                                  # Route 18
+    110:30,                                                  # Route 17
+    111:42,                                                  # Undella Town
+}
+
+# Encounter NARC file index (fielddata/encountdata/pl_enc_data.narc) -> location_names text index
+# Built by species cross-reference against Platinum location list.
+# Platinum has NO flat enc->loc in ARM9 (stride 6 is garbage). Hardcoded like HGSS.
+_CPU_ENC_LOC = {
+    5:46, 6:46,                                             # Oreburgh Mine
+    7:47,                                                   # Valley Windworks
+    8:48,                                                   # Eterna Forest
+    9:28,                                                   # Route 213
+    10:22, 21:22,                                           # Route 207
+    11:50, 12:50, 13:50, 14:50, 15:50, 16:50, 17:50,       # Mt. Coronet
+    18:50, 19:50, 20:50, 22:50,                             # Mt. Coronet
+    23:45, 24:45, 25:45, 26:45, 27:45, 28:45,              # Route 230
+    29:53, 30:53, 31:53, 32:53, 33:53, 34:53, 35:53,       # Solaceon Ruins (Unown)
+    36:53, 37:53, 38:53, 39:53, 40:53, 41:53, 42:53,       # Solaceon Ruins (Unown)
+    43:53, 44:53, 45:53, 46:53,                             # Solaceon Ruins (Unown)
+    47:54, 48:54, 49:54, 50:54, 51:54, 52:54,              # Victory Road
+    53:57, 54:57, 55:57,                                    # Ravaged Path
+    56:41, 57:41,                                           # Route 226
+    58:84,                                                  # Stark Mountain
+    59:73,                                                  # Valor Lakefront
+    60:70, 63:70, 64:70, 65:70, 66:70, 67:70, 68:70,       # Old Chateau
+    61:117, 62:117,                                         # Distortion World
+    69:117, 70:117, 71:117, 72:117, 73:117, 74:117,         # Distortion World
+    75:117, 76:117, 77:117, 78:117, 79:117, 80:117,         # Distortion World
+    81:117, 82:117, 83:117, 84:117, 85:117, 86:117,         # Distortion World
+    87:117, 88:117, 89:117, 90:117, 91:117, 92:117,         # Distortion World
+    93:117, 94:117, 95:117, 96:117, 97:117, 98:117,         # Distortion World
+    99:117, 100:117, 101:117, 102:117, 103:117, 104:117,    # Distortion World
+    105:117,                                                # Distortion World
+    106:32, 107:32, 108:32, 109:32, 110:32, 111:32,        # Route 217 (Jynx/Sneasel/Smoochum)
+    112:46,                                                 # Oreburgh Mine
+    113:65,                                                 # Wayward Cave (Gible)
+    114:66, 115:66, 116:66,                                 # Ruin Maniac Cave (Hippopotas)
+    117:68,                                                 # Trophy Garden (Pikachu)
+    119:50,                                                 # Mt. Coronet
+    120:69, 121:69, 122:69, 123:69, 124:69,                # Iron Island
+    125:62, 126:62, 127:62, 128:62, 129:62,                # Turnback Cave (Gastly)
+    130:62, 131:62, 132:62, 133:62,                        # Turnback Cave (Gastly)
+    134:16, 135:16,                                        # Route 201
+    136:76,                                                # Lake Verity
+    137:31,                                                # Route 216
+    138:29,                                                # Route 214
+    139:31,                                                # Route 216
+    140:17, 141:17, 142:17, 143:17, 144:17,               # Route 202
+    145:20,                                                # Route 205
+    146:48,                                                # Eterna Forest
+    147:21, 148:21,                                        # Route 206
+    149:23, 150:23,                                        # Route 208
+    151:70, 152:70, 153:70, 154:70, 155:70,               # Old Chateau (Gastly/Golbat)
+    156:21,                                                # Route 206
+    157:22, 158:22, 159:50,                                # Route 207 / Mt. Coronet
+    160:23,                                                # Route 208
+    161:27,                                                # Route 212 (Croagunk)
+    162:28,                                                # Route 213
+    163:29,                                                # Route 214
+    164:30,                                                # Route 215
+    165:32,                                                # Route 217
+    166:31,                                                # Route 216
+    167:28,                                                # Route 213
+    169:36,                                                # Route 221
+    170:37,                                                # Route 222
+    171:44,                                                # Route 229
+    172:54,                                                # Victory Road
+    173:41,                                                # Route 226
+    174:43,                                                # Route 228
+    175:44,                                                # Route 229
+    181:54,                                                # Victory Road
+    182:28,                                                # Route 213
+}
+
+# Encounter NARC file index (a/1/3/6) -> location_names text table index (a/0/2/7:279)
+# Built by species cross-reference: each encounter file's species composition was matched
+# to known HGSS locations. HGSS has NO flat enc->loc table in the binary (unlike DP/Pt) —
+# the game resolves encounters through map headers at runtime. 142 entries, all verified.
+_HGSS_ENC_LOC = {
+    0: 126,                                              # New Bark Town
+    1: 177,                                              # Route 29
+    2: 127,                                              # Cherrygrove City
+    3: 178,                                              # Route 30
+    4: 179,                                              # Route 31
+    5: 128,                                              # Violet City
+    6: 204, 7: 204,                                      # Sprout Tower
+    8: 180,                                              # Route 32
+    9: 209, 10: 209, 11: 209, 12: 209, 13: 209,         # Ruins of Alph
+    14: 210, 15: 210, 16: 210,                           # Union Cave
+    17: 181,                                              # Route 33
+    18: 211, 19: 211,                                    # SLOWPOKE Well
+    20: 214,                                              # Ilex Forest
+    21: 182,                                              # Route 34
+    22: 183,                                              # Route 35
+    23: 207, 24: 207,                                    # National Park
+    25: 184,                                              # Route 36
+    26: 185,                                              # Route 37
+    27: 133,                                              # Ecruteak City
+    28: 206, 29: 206,                                    # Burned Tower
+    30: 205, 31: 205, 32: 205, 33: 205,                 # Bell Tower
+    34: 205, 35: 205, 36: 205, 37: 205,
+    38: 186,                                              # Route 38
+    39: 187,                                              # Route 39
+    40: 132,                                              # Olivine City
+    41: 188,                                              # Route 40
+    42: 189,                                              # Route 41
+    43: 218, 44: 218, 45: 218, 46: 218,                 # Whirl Islands
+    47: 218, 48: 218, 49: 218, 50: 218,
+    51: 130,                                              # Cianwood City
+    52: 190,                                              # Route 42
+    53: 216, 54: 216, 55: 216, 56: 216,                 # Mt. Mortar
+    57: 191,                                              # Route 43
+    58: 135,                                              # Lake of Rage
+    59: 192,                                              # Route 44
+    60: 217, 61: 217, 62: 217, 63: 217,                 # Ice Path
+    64: 136,                                              # Blackthorn City
+    65: 136,                                              # Blackthorn City
+    66: 222,                                              # Dragon's Den
+    67: 193,                                              # Route 45
+    68: 194,                                              # Route 46
+    69: 220, 70: 220,                                    # Dark Cave
+    71: 195,                                              # Route 47
+    72: 196, 73: 196,                                    # Route 48
+    74: 228, 75: 228, 76: 228, 77: 228, 78: 228,       # Cliff Cave
+    79: 219, 80: 219, 81: 219, 82: 219,                 # Mt. Silver Cave
+    83: 234,                                              # Cliff Edge Gate
+    84: 227,                                              # Safari Zone Gate
+    85: 176,                                              # Route 28
+    86: 219, 87: 219, 88: 219, 89: 219,                 # Mt. Silver Cave
+    90: 137,                                              # Mt. Silver
+    91: 174,                                              # Route 26
+    92: 175,                                              # Route 27
+    93: 223,                                              # Tohjo Falls
+    94: 175,                                              # Route 27
+    95: 174,                                              # Route 26
+    96: 143,                                              # Vermilion City
+    97: 139,                                              # Viridian City
+    98: 138,                                              # Pallet Town
+    99: 144,                                              # Celadon City
+    100: 145,                                             # Fuchsia City
+    101: 146,                                             # Cinnabar Island
+    102: 195,                                             # Route 47
+    103: 161,                                             # Route 13
+    104: 162,                                             # Route 14
+    105: 176,                                             # Route 28
+    106: 198, 107: 198,                                  # Mt. Moon
+    108: 200, 109: 200,                                  # Rock Tunnel
+    110: 221,                                             # Victory Road
+    111: 149,                                             # Route 1
+    112: 150,                                             # Route 2
+    113: 151,                                             # Route 3
+    114: 152,                                             # Route 4
+    115: 153,                                             # Route 5
+    116: 154,                                             # Route 6
+    117: 155,                                             # Route 7
+    118: 156,                                             # Route 8
+    119: 157,                                             # Route 9
+    120: 158,                                             # Route 10
+    121: 159,                                             # Route 11
+    122: 161,                                             # Route 13
+    123: 162,                                             # Route 14
+    124: 163,                                             # Route 15
+    125: 164,                                             # Route 16
+    126: 165,                                             # Route 17
+    127: 166,                                             # Route 18
+    128: 169,                                             # Route 21
+    129: 170,                                             # Route 22
+    130: 172,                                             # Route 24
+    131: 173,                                             # Route 25
+    132: 223,                                             # Tohjo Falls
+    133: 197,                                             # Diglett's Cave
+    134: 221, 135: 221,                                  # Victory Road
+    136: 150,                                             # Route 2
+    137: 224,                                             # Viridian Forest
+    138: 226,                                             # S.S. Aqua
+    139: 199, 140: 199, 141: 199,                        # Cerulean Cave
+}
+
+# (species_id, form_idx) -> parenthetical label appended to species name in encounter display
+# Form 0 entries are included when the base form has a meaningful name (e.g. Basculin Red-Striped)
+_FORM_NAMES = {
+    (351, 1): "Sunny", (351, 2): "Rainy", (351, 3): "Snowy",
+    (386, 1): "Attack", (386, 2): "Defense", (386, 3): "Speed",
+    (412, 0): "Plant", (412, 1): "Sandy", (412, 2): "Trash",
+    (413, 0): "Plant", (413, 1): "Sandy", (413, 2): "Trash",
+    (421, 1): "Sunshine",
+    (422, 0): "West", (422, 1): "East",
+    (423, 0): "West", (423, 1): "East",
+    (479, 1): "Heat", (479, 2): "Wash", (479, 3): "Frost", (479, 4): "Fan", (479, 5): "Mow",
+    (487, 1): "Origin",
+    (492, 1): "Sky",
+    (550, 0): "Red-Striped", (550, 1): "Blue-Striped",
+    (555, 0): "Standard", (555, 1): "Zen Mode",
+    (585, 0): "Spring", (585, 1): "Summer", (585, 2): "Autumn", (585, 3): "Winter",
+    (586, 0): "Spring", (586, 1): "Summer", (586, 2): "Autumn", (586, 3): "Winter",
+    (641, 1): "Therian", (642, 1): "Therian", (645, 1): "Therian",
+    (646, 1): "White", (646, 2): "Black",
+    (647, 1): "Resolute",
+    (648, 1): "Pirouette",
+}
+
+
 def _decode_encounters_gen5(data: bytes) -> dict:
     """Decode Gen V encounter data (BW/B2W2).
     232 bytes per season. Species u16 encodes form in upper bits (& 0x7FF)."""
@@ -2189,8 +3091,11 @@ def _decode_encounters_gen5(data: bytes) -> dict:
                 if species_id == 0:
                     continue
                 name = get_text("species", species_id)
-                if form > 0:
-                    name += f" (form {form})"
+                form_label = _FORM_NAMES.get((species_id, form))
+                if form_label is None and form > 0:
+                    form_label = f"Form {form}"
+                if form_label:
+                    name += f" ({form_label})"
                 entries.append({"species": name, "level": f"{min_lv}-{max_lv}" if min_lv != max_lv else str(min_lv)})
             return entries
 
@@ -2508,7 +3413,7 @@ def _format_section(entries, rates, header):
     lines = [f"\n{header}:"]
     for e in consolidated:
         lv = e['level'].replace('Lv', 'Lv. ')
-        lines.append(f"  {e['species']:<14}{lv:<12}{e['rate']:>3}%")
+        lines.append(f"  {e['species']:<20}{lv:<12}{e['rate']:>3}%")
     return "\n".join(lines)
 
 
@@ -2558,7 +3463,7 @@ def _format_encounter_hgss(decoded, file_idx):
         lines.append("Grass (Default):")
         for si in species_info:
             lv = si['level'].replace('Lv', 'Lv. ')
-            lines.append(f"  {si['species']:<14}{lv:<12}{si['rate_str']}")
+            lines.append(f"  {si['species']:<20}{lv:<12}{si['rate_str']}")
 
     water_sections = [
         ('surf', 'Surf (Default)'), ('rock_smash', 'Rock Smash'),
@@ -2682,7 +3587,7 @@ def _format_encounter_gen5_seasonal(seasons, file_idx):
         lines.append(f"\n{header}:")
         for si in species_info:
             lv = si['level'].replace('Lv', 'Lv. ')
-            lines.append(f"  {si['species']:<14}{lv:<12}{si['rate_str']}")
+            lines.append(f"  {si['species']:<20}{lv:<12}{si['rate_str']}")
 
     return "\n".join(lines).strip() if lines else None
 
@@ -2719,18 +3624,15 @@ def format_encounter(decoded, file_idx):
     if not decoded:
         return None
 
-    # Route to gen-specific formatter
-    if 'seasons' in decoded:
-        body = _format_encounter_gen5(decoded, file_idx)
-    elif isinstance(decoded.get('grass', {}), dict) and 'morning' in decoded.get('grass', {}):
-        body = _format_encounter_hgss(decoded, file_idx)
-    elif isinstance(decoded.get('grass'), list):
-        gen = text_gen or 5
-        body = _format_encounter_gen5(decoded, file_idx) if gen == 5 else _format_encounter_dpp(decoded, file_idx)
-    elif any(k in decoded for k in ('surf', 'special_surf', 'fishing', 'special_fishing', 'double_grass', 'special_grass')):
-        body = _format_encounter_gen5(decoded, file_idx) if (text_gen or 5) == 5 else None
-    elif any(k in decoded for k in ('surf', 'old_rod', 'good_rod', 'super_rod', 'rock_smash', 'sound')):
-        body = _format_encounter_hgss(decoded, file_idx) if (text_gen or 5) <= 4 else None
+    # Route by gen first, then format variant
+    gen = text_gen or 5
+    if gen == 5:
+        body = _format_encounter_gen5(decoded, file_idx)  # handles seasons internally
+    elif gen == 4:
+        if isinstance(decoded.get('grass', {}), dict) and 'morning' in decoded.get('grass', {}):
+            body = _format_encounter_hgss(decoded, file_idx)
+        else:
+            body = _format_encounter_dpp(decoded, file_idx)
     else:
         return None
 
@@ -2739,7 +3641,9 @@ def format_encounter(decoded, file_idx):
 
     # Prepend title line (location name or generic)
     location = decoded.get('location', '')
-    title = location if location else f"Encounter Zone #{file_idx}"
+    _loc_clean = location.strip() if location else ''
+    _printable = sum(c.isascii() and c.isprintable() for c in _loc_clean)
+    title = _loc_clean if _loc_clean and _printable >= len(_loc_clean) * 0.75 else f"Encounter Zone #{file_idx}"
     # Strip "Location: " prefix if the formatter already added it
     body = body.lstrip('\n')
     if body.startswith('Location:'):
@@ -2771,30 +3675,77 @@ def format_trainer(file_idx):
         trpoke = decode_trpoke(tp_data, td_data)
 
         template = td_data[0] & 0x03
-        poke_size = TRPOKE_FORMATS.get(template, 8)
+        gen = text_gen or 5
+        _fmts = TRPOKE_FORMATS_G4 if gen <= 4 else TRPOKE_FORMATS_G5
+        poke_size = _fmts.get(template, _fmts[0])
         num_pokemon = len(tp_data) // poke_size
         prize = 0
         if num_pokemon > 0:
             last_off = (num_pokemon - 1) * poke_size
-            last_level = tp_data[last_off + 2]
+            if gen <= 4:
+                last_level = struct.unpack_from('<H', tp_data, last_off + 2)[0]
+            else:
+                last_level = tp_data[last_off + 2]
             prize = trdata.get("reward_multiplier", 0) * last_level * 4
 
         class_name = trdata.get('class', '???')
         trainer_name = trdata.get('name', f'Trainer #{file_idx}')
 
-        lines = [f"{class_name} {trainer_name}"]
+        # Look up location for special trainers (Gym Leaders, E4, Champions, etc.)
+        game_code = current_rom['header']['game_code'] if current_rom else None
+        location = get_trainer_location(game_code, class_name, trainer_name) if game_code else None
+        
+        if location:
+            lines = [f"{class_name} {trainer_name} - {location}"]
+        else:
+            lines = [f"{class_name} {trainer_name}"]
 
+        _chal_delta = get_bw2_challenge_delta(file_idx, game_code)
+
+
+
+        _gen = text_gen or 5
         pokemon = trpoke.get('pokemon', [])
         for poke in pokemon:
             species = poke.get('species', '???')
+            species_id = poke.get('species_id', 0)
             level = poke.get('level', '?')
             held = poke.get('held_item', None)
 
-            header = f"{species} (Lv. {level})"
+            # Gen IV uses ALL CAPS species names; Gen V uses title case
+            if _gen <= 4:
+                species = species.upper()
+
+            # Form resolution
+            form_idx = poke.get('form', 0)
+            if form_idx:
+                form_label = _FORM_NAMES.get((species_id, form_idx), '')
+                if form_label:
+                    species = f"{species}-{form_label}"
+
+            _delta = _chal_delta
+            if _delta:
+                header = f"{species} (Lv. {level + _delta})"
+            else:
+                header = f"{species} (Lv. {level})"
             if held and held != 'None':
                 header += f"  [{held}]"
-            lines.append("")
             lines.append(header)
+
+            # Ability / IVs / Gender line
+            ability = poke.get('ability')
+            iv_val = poke.get('ivs')
+            gender = poke.get('gender')
+            gender_sym = {'Male': '♂', 'Female': '♀', 'Genderless': '⚲'}.get(gender, '')
+            meta_parts = []
+            if ability:
+                meta_parts.append(f"Ability: {ability}")
+            if iv_val is not None:
+                meta_parts.append(f"IVs: {iv_val}/{iv_val}/{iv_val}/{iv_val}/{iv_val}/{iv_val}")
+            if gender_sym:
+                meta_parts.append(gender_sym)
+            if meta_parts:
+                lines.append('  '.join(meta_parts))
 
             moves = poke.get('moves', [])
             if moves:
@@ -2829,17 +3780,37 @@ def _format_hex(data: bytes, base_offset: int = 0) -> str:
     return '\n'.join(lines)
 
 
+def _notes_for_path(path: str) -> str:
+    """Return flipnote notes matching this path. Surfaces before raw bytes so models read what's known first."""
+    if not current_flipnote:
+        return ''
+    notes = current_flipnote['data'].get('notes', {})
+    hits = []
+    narc_part = path.rsplit(':', 1)[0] if ':' in path else path
+    for key in (path, narc_part):
+        if key in notes:
+            n = notes[key]
+            hits.append(f"[known: {key}] {n.get('description', n) if isinstance(n, dict) else n}")
+    # arm9: surface arm9/* and patches/* notes
+    if path.lower().startswith('arm9') and not hits:
+        for key, n in notes.items():
+            if key.startswith('arm9/') or key.startswith('patches/'):
+                desc = n.get('description', n) if isinstance(n, dict) else n
+                hits.append(f"[known: {key}] {str(desc)[:140]}")
+    return '\n'.join(hits)
+
+
 def _auto_decode(path: str, data: bytes):
     """Auto-decode known structures by role, not hardcoded paths."""
     if not narc_roles or ':' not in path:
-        return None
+        return {"_unknown": True, "reason": "no role mapping", "hint": f"scope({path}) for raw bytes"}
 
     narc_part, idx_str = path.rsplit(':', 1)
     narc_part = narc_part.strip('/')
     file_idx = int(idx_str)
     role = narc_roles.get(narc_part)
     if not role:
-        return None
+        return {"_unknown": True, "reason": f"no role for {narc_part}", "hint": f"scope({path}) or dowse(name='...', narc_path='{narc_part}')"}
 
     rom = current_rom['rom']
 
@@ -2858,28 +3829,45 @@ def _auto_decode(path: str, data: bytes):
         elif role == 'encounters':
             decoded = decode_encounters(data)
             if decoded:
-                location_names = text_tables.get('location_names', [])
-                if file_idx < len(location_names):
-                    decoded['location'] = location_names[file_idx]
+                # Resolve location name -- use game-specific mapping
+                gc = current_rom['header']['game_code'] if current_rom else ''
+                loc_id = 0
+                if gc in ('IRE', 'IRD'):  # Black 2 / White 2
+                    loc_id = _B2W2_ENC_LOC.get(file_idx, 0)
+                elif gc in ('IRB', 'IRA'):  # Black / White
+                    loc_id = _BW1_ENC_LOC.get(file_idx, 0)
+                elif gc in ('ADA', 'APA'):  # Diamond / Pearl
+                    arm9 = current_rom.get('arm9_data')
+                    if arm9 and 0xED738 + file_idx * 2 + 2 <= len(arm9):
+                        loc_id = struct.unpack_from('<H', arm9, 0xED738 + file_idx * 2)[0]
+                elif gc == 'CPU':  # Platinum
+                    loc_id = _CPU_ENC_LOC.get(file_idx, 0)
+                elif gc in ('IPK','IPG'):  # HG/SS
+                    loc_id = _HGSS_ENC_LOC.get(file_idx, 0)
+                if loc_id:
+                    location_names = text_tables.get('location_names', [])
+                    decoded['location'] = location_names[loc_id] if loc_id < len(location_names) else f'Area #{file_idx}'
+                else:
+                    decoded['location'] = f'Area #{file_idx}'
                 formatted = format_encounter(decoded, file_idx)
                 return formatted if formatted else decoded
-        elif role in ('pwt_rosters', 'pwt_rosters_b'):
-            pool = 'Rosters-B' if role.endswith('_b') else 'Rosters'
-            return decode_pwt_roster(data, file_idx, pool)
-        elif role in ('pwt_trainers', 'pwt_trainers_b'):
-            pool = 'Trainers-B' if role.endswith('_b') else 'Trainers'
-            return decode_pwt_trainer_config(data, file_idx, pool)
-        elif role.startswith('pwt_') and role not in ('pwt_download', 'pwt_ui'):
+        elif role == 'pwt_defs':
+            return decode_pwt_tournament_def(data, file_idx)
+        elif role.startswith('pwt_rosters'):
+            return decode_pwt_roster(data, file_idx, roster_role=role)
+        elif role.startswith('pwt_trainers'):
+            return decode_pwt_trainer_config(data, file_idx, trainer_role=role)
+        elif role in _PWT_POOL_ROLES:
             pool = role[4:].replace('_b', '-B').replace('_', ' ').title()
             return decode_pwt(data, 'champions' in role, pool, file_idx)
         elif role == 'subway_pokemon':
             return decode_pwt(data, False, 'Battle Subway', file_idx)
         elif role == 'subway_trainers':
-            return decode_pwt_roster(data, file_idx, 'Battle Subway')
+            return decode_pwt_roster(data, file_idx, roster_role='subway_trainers')
         elif role == 'battle_tower_pokemon':
             return decode_pwt(data, True, 'Battle Tower', file_idx)
         elif role == 'battle_tower_trainers':
-            return decode_pwt_roster(data, file_idx, 'Battle Tower')
+            return decode_pwt_roster(data, file_idx, roster_role='battle_tower_trainers')
         elif role == 'pokeathlon_performance':
             return decode_pokeathlon_performance(data, file_idx)
         elif role == 'contest':
@@ -2946,35 +3934,83 @@ async def spotlight(path: str) -> dict:
                 header['region_char'], structure, rom_stats, header['is_english']
             )
 
-        # Decompress ARM9 in memory
-        arm9_data = bytearray(rom.arm9)
-        arm7_data = bytearray(rom.arm7)
+        # Decompress ARM9 via blz (ndspy does NOT decompress BLZ-compressed ARM9)
+        raw_arm9 = bytes(rom.arm9)
         try:
-            import tempfile
             with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as tmp:
-                tmp.write(arm9_data)
+                tmp.write(raw_arm9)
                 tmp_path = tmp.name
             decompress_arm9(tmp_path)
             with open(tmp_path, 'rb') as f:
                 arm9_data = bytearray(f.read())
-            Path(tmp_path).unlink()
-        except:
-            pass
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            # Fallback: use raw if blz fails (might not be compressed)
+            arm9_data = bytearray(raw_arm9)
+
+        # --- BW2 Challenge/Easy Mode stat recalc patch (silent, in-memory only) ---
+        # The vanilla B2/W2 ROM has a bug where difficulty modes change enemy levels
+        # but don't recalculate stats. This patches the decompressed ARM9 in memory
+        # so the model never encounters the broken routine.
+        _BW2_PATCH_OFFSET = 0x145D0
+        _BW2_PATCH_LEN = 172
+        if gc in ('IRE', 'IRD') and len(arm9_data) > _BW2_PATCH_OFFSET + _BW2_PATCH_LEN:
+            _b2_patch = bytes([
+                0xF8,0xB5,0x82,0xB0,0x00,0x90,0x15,0x1C,0x08,0x1C,0xFF,0xF7,0xAB,0xF9,0xF7,0xF7,
+                0x61,0xFF,0xF7,0xF7,0xA1,0xFF,0x04,0x1C,0x28,0x1C,0x00,0xF0,0x77,0xFB,0x07,0x1C,
+                0x4F,0x21,0x00,0x98,0x00,0x22,0x89,0x00,0x42,0x54,0x00,0x2C,0x01,0xD1,0x50,0x1E,
+                0x47,0x43,0x01,0x2C,0x36,0xD0,0x4F,0x21,0x00,0x98,0x89,0x00,0x47,0x54,0x00,0x20,
+                0x01,0x90,0x01,0x98,0x81,0x00,0x18,0x48,0x40,0x58,0x81,0x00,0x00,0x98,0x40,0x18,
+                0x45,0x6A,0x00,0x2D,0x21,0xD0,0x28,0x1C,0x00,0x24,0x07,0xF0,0xE5,0xFB,0x00,0x28,
+                0x1B,0xDD,0x28,0x1C,0x21,0x1C,0x07,0xF0,0x67,0xFC,0x06,0x1C,0x9E,0x21,0x00,0x22,
+                0x04,0xF0,0x5A,0xFB,0x00,0x04,0x00,0x0C,0xC2,0x19,0x00,0x2A,0x00,0xDC,0x01,0x22,
+                0x30,0x1C,0x9E,0x21,0x04,0xF0,0x62,0xFB,0x30,0x1C,0x05,0xF0,0x59,0xFA,0x28,0x1C,
+                0x64,0x1C,0x07,0xF0,0xC9,0xFB,0x84,0x42,0xE3,0xDB,0x01,0x98,0x40,0x1C,0x01,0x90,
+                0x02,0x28,0xCE,0xD3,0x02,0xB0,0xF8,0xBD,0x68,0x00,0x09,0x02,
+            ])
+            _w2_patch = bytes([
+                0xF8,0xB5,0x82,0xB0,0x00,0x90,0x15,0x1C,0x08,0x1C,0xFF,0xF7,0xAB,0xF9,0xF7,0xF7,
+                0x61,0xFF,0xF7,0xF7,0xA1,0xFF,0x04,0x1C,0x28,0x1C,0x00,0xF0,0x8D,0xFB,0x07,0x1C,
+                0x4F,0x21,0x00,0x98,0x00,0x22,0x89,0x00,0x42,0x54,0x00,0x2C,0x01,0xD1,0x50,0x1E,
+                0x47,0x43,0x01,0x2C,0x36,0xD0,0x4F,0x21,0x00,0x98,0x89,0x00,0x47,0x54,0x00,0x20,
+                0x01,0x90,0x01,0x98,0x81,0x00,0x18,0x48,0x40,0x58,0x81,0x00,0x00,0x98,0x40,0x18,
+                0x45,0x6A,0x00,0x2D,0x21,0xD0,0x28,0x1C,0x00,0x24,0x07,0xF0,0xFB,0xFB,0x00,0x28,
+                0x1B,0xDD,0x28,0x1C,0x21,0x1C,0x07,0xF0,0x7D,0xFC,0x06,0x1C,0x9E,0x21,0x00,0x22,
+                0x04,0xF0,0x70,0xFB,0x00,0x04,0x00,0x0C,0xC2,0x19,0x00,0x2A,0x00,0xDC,0x01,0x22,
+                0x30,0x1C,0x9E,0x21,0x04,0xF0,0x78,0xFB,0x30,0x1C,0x05,0xF0,0x6F,0xFA,0x28,0x1C,
+                0x64,0x1C,0x07,0xF0,0xDF,0xFB,0x84,0x42,0xE3,0xDB,0x01,0x98,0x40,0x1C,0x01,0x90,
+                0x02,0x28,0xCE,0xD3,0x02,0xB0,0xF8,0xBD,0x94,0x00,0x09,0x02,
+            ])
+            # Verified fingerprinting (tested against 3 ROMs):
+            #   Prologue bytes 0-7: F8 B5 82 B0 00 90 15 1C (same in all BW2 ROMs)
+            #   Byte 30: 0x00 = unpatched, 0x07 = already patched
+            #   Byte 28: 0x77 = Black 2, 0x8D = White 2
+            _prologue = bytes([0xF8,0xB5,0x82,0xB0,0x00,0x90,0x15,0x1C])
+            _cur_pro = bytes(arm9_data[_BW2_PATCH_OFFSET:_BW2_PATCH_OFFSET + 8])
+            if _cur_pro == _prologue and arm9_data[_BW2_PATCH_OFFSET + 30] == 0x00:
+                # Unpatched. Byte 28 tells us which game's patch to apply.
+                _byte28 = arm9_data[_BW2_PATCH_OFFSET + 28]
+                if _byte28 == 0x77:    # Black 2
+                    arm9_data[_BW2_PATCH_OFFSET:_BW2_PATCH_OFFSET + _BW2_PATCH_LEN] = _b2_patch
+                elif _byte28 == 0x8D:  # White 2
+                    arm9_data[_BW2_PATCH_OFFSET:_BW2_PATCH_OFFSET + _BW2_PATCH_LEN] = _w2_patch
+
+        arm7_data = bytearray(rom.arm7)
+
+        # Load and decompress all ARM9 overlays
+        overlays = _load_overlays(rom)
 
         current_rom = {
             'type': 'nds', 'path': path, 'rom': rom, 'header': header,
             'arm9_data': arm9_data, 'arm7_data': arm7_data,
+            'overlays': overlays,
             'compression_state': {}
         }
 
-        # Pre-set text_gen so F100 discovery knows which generation this is
+        # Pre-set text_gen before bootstrapping text tables
         global text_gen
         game_info = GAME_INFO.get(gc, {})
         text_gen = game_info.get('gen')
-
-        # Discover F100 9-bit compression table from ARM9 (Gen IV only).
-        # Must run BEFORE bootstrap_text_tables so trainer names decode correctly.
-        f100_count = _discover_f100_table()
 
         # Bootstrap text tables (Gen IV/V)
         try:
@@ -2986,9 +4022,6 @@ async def spotlight(path: str) -> dict:
         tm_count = _discover_tm_table()
         if tm_count:
             text_table_result["tm_table"] = f"{tm_count} TM/HM entries found"
-
-        if f100_count:
-            text_table_result["f100_table"] = f"{f100_count}-entry compression table found"
 
     else:  # gba/gbc/gb
         fpn_path = find_flipnote(gc)
@@ -3007,27 +4040,51 @@ async def spotlight(path: str) -> dict:
     # Store in loaded_roms
     _save_active_state()
 
-    # Persist last opened ROM path for Eonet auto-restore
+    # Persist opened ROM registry for auto-restore on startup
     try:
         last_rom_file = Path.home() / ".linkplay" / "last_rom.json"
-        with open(last_rom_file, 'w', encoding='utf-8') as f:
-            json.dump({"path": path, "game_code": gc}, f)
+        registry = {}
+        if last_rom_file.exists():
+            try:
+                registry = json.loads(last_rom_file.read_text(encoding='utf-8'))
+                # Migrate old single-entry format {path, game_code} -> registry
+                if 'game_code' in registry:
+                    registry = {registry['game_code']: registry['path']}
+            except Exception:
+                registry = {}
+        registry[gc] = path
+        last_rom_file.write_text(json.dumps(registry, indent=2), encoding='utf-8')
     except Exception:
         pass
 
-    result = {
-        "rom_type": rom_type, "game_code": gc,
-        "game_title": header['game_title'], "region": header['region'],
-        "flipnote": str(fpn_path), "loaded": list(loaded_roms.keys())
-    }
-    if text_table_result:
-        result["text_tables"] = text_table_result
-
-    # Build Eonet: auto-discover NARCs, label everything, build search index
+    # Build Eonet in background — capture gc now so the thread doesn't race on current_rom
     if current_rom and current_rom['type'] == 'nds':
-        _build_eonet()
+        import asyncio as _asyncio
+        _gc_capture = gc
+        _asyncio.ensure_future(
+            _asyncio.get_event_loop().run_in_executor(None, lambda: _build_eonet(_gc_capture))
+        )
 
-    return result
+    # Build clean summary card
+    game_info = GAME_INFO.get(gc, {})
+    narcs = game_info.get("narcs", {})
+    lines = [
+        f"{header['game_title']} ({gc}) — {header['region']}",
+        f"Type: {rom_type}  |  Loaded: {list(loaded_roms.keys())}",
+    ]
+    tt = text_table_result
+    if tt and tt.get("status") == "ok":
+        detected = list(tt.get("detected", {}).keys())
+        lines.append(f"Text: Gen {tt['gen']} decoded — {tt['file_count']} files, tables: {', '.join(detected)}")
+        if tt.get("tm_table"): lines.append(f"TM/HM: {tt['tm_table']}")
+    elif tt and tt.get("error"):
+        lines.append(f"Text: ERROR — {tt['error']}")
+    key_roles = ("trdata", "trpoke", "personal", "learnsets", "encounters", "items")
+    for role in key_roles:
+        if role in narcs: lines.append(f"  {role}: {narcs[role]}")
+    lines.append(f"Flipnote: {fpn_path}")
+    lines.append("ICR indexing in background...")
+    return {"_card": True, "text": "\n".join(lines), "game_code": gc, "loaded": list(loaded_roms.keys())}
 
 
 async def return_tool(save: bool = False) -> dict:
@@ -3080,19 +4137,35 @@ async def summarize(path: str = "/", expand_narcs: bool = False) -> dict:
     # Check if path is a NARC file
     clean_path = path.strip('/')
     if clean_path and not clean_path.endswith('/'):
+        # Check for overlay path
+        ov_id = _is_overlay_path(clean_path)
+        if ov_id >= 0:
+            overlays = current_rom.get('overlays', {})
+            if ov_id in overlays:
+                data = overlays[ov_id]
+                return {"path": clean_path, "type": "overlay", "size": len(data),
+                        "overlay_id": ov_id}
+            else:
+                return {"error": f"Overlay {ov_id} not found (available: {sorted(overlays.keys())})"}
         try:
             file_data = rom.getFileByName(clean_path)
             if file_data[:4] == b'NARC':
                 narc = _get_narc(clean_path)
+                gc = current_rom['header']['game_code']
+                narc_lbl = eonet_labels.get(gc, {}).get(clean_path, {}).get('labels', {})
+                narc_role = narc_roles.get(clean_path)
                 for i, f in enumerate(narc.files):
                     entry = {"index": i, "size": len(f), "path": f"{clean_path}:{i}"}
+                    if narc_lbl.get(i): entry["label"] = narc_lbl[i]
                     if len(f) >= 4:
                         if f[0] == 0x10: entry["compression"] = "lz10"
                         elif f[0] == 0x11: entry["compression"] = "lz11"
                         elif f[0] in (0x24, 0x28): entry["compression"] = "huffman"
                         elif f[0] == 0x30: entry["compression"] = "rle"
                     contents.append(entry)
-                return {"path": clean_path, "type": "narc", "file_count": len(narc.files), "contents": contents}
+                result = {"path": clean_path, "type": "narc", "file_count": len(narc.files), "contents": contents}
+                if narc_role: result["role"] = narc_role
+                return result
         except:
             pass
 
@@ -3116,6 +4189,15 @@ async def summarize(path: str = "/", expand_narcs: bool = False) -> dict:
                 if not found:
                     return {"error": f"Path not found: {path}"}
 
+        # At root level, include arm9/arm7/overlays
+        if path == '/':
+            contents.append({"name": "arm9.bin", "type": "binary", "size": len(current_rom['arm9_data'])})
+            contents.append({"name": "arm7.bin", "type": "binary", "size": len(current_rom['arm7_data'])})
+            overlays = current_rom.get('overlays', {})
+            for ov_id in sorted(overlays.keys()):
+                contents.append({"name": f"overlay{ov_id}.bin", "type": "overlay",
+                                 "size": len(overlays[ov_id]), "overlay_id": ov_id})
+
         for filename in folder.files:
             file_id = folder.idOf(filename)
             file_data = rom.files[file_id]
@@ -3130,6 +4212,8 @@ async def summarize(path: str = "/", expand_narcs: bool = False) -> dict:
                     entry["file_count"] = len(narc.files)
                 except:
                     pass
+                role = narc_roles.get(full_path)
+                if role: entry["role"] = role
 
             contents.append(entry)
 
@@ -3143,65 +4227,17 @@ async def summarize(path: str = "/", expand_narcs: bool = False) -> dict:
 
 
 
-def _structured_read(path, data, offset, reads, count, xor, endian, stride, base):
-    """Structured binary read inside decipher. XOR, typed reads, pointer following."""
-    if xor:
-        xk = bytes.fromhex(xor.replace(' ', ''))
-        data = bytes(b ^ xk[i % len(xk)] for i, b in enumerate(data))
-    if reads == 'text':
-        gen = text_gen or 5
-        if gen == 5 and text_mult is not None:
-            strings = decode_gen5_text(data, text_mult)
-        elif gen == 4:
-            strings = decode_gen4_text(data)
-        else:
-            return {"error": "No text decoder available"}
-        return {"path": path, "type": "text", "entries": len(strings),
-                "strings": strings[:count] if count < len(strings) else strings}
-    ti = {'u8': (1, 'B'), 'u16': (2, 'H'), 'u32': (4, 'I'),
-          's8': (1, 'b'), 's16': (2, 'h'), 's32': (4, 'i'), 'ptr32': (4, 'I')}
-    if reads not in ti:
-        return {"error": f"Unknown type: {reads}. Use: u8 u16 u32 s8 s16 s32 ptr32 text"}
-    sz, fc = ti[reads]
-    bo = '<' if endian == 'little' else '>'
-    step = stride if stride > 0 else sz
-    sp = text_tables.get('species', [])
-    mv = text_tables.get('moves', [])
-    it = text_tables.get('items', [])
-    res = []
-    for i in range(count):
-        pos = offset + i * step
-        if pos + sz > len(data):
-            res.append({"i": i, "off": f"0x{pos:X}", "error": "EOF"}); break
-        val = struct.unpack_from(f'{bo}{fc}', data, pos)[0]
-        e = {"i": i, "off": f"0x{pos:X}", "val": val, "hex": f"0x{val:0{sz*2}X}"}
-        if reads in ('u16', 'u32') and val > 0:
-            if val < len(sp) and val < 700: e["species?"] = sp[val]
-            if val < len(mv) and val < 600: e["move?"] = mv[val]
-            if val < len(it) and val < 800: e["item?"] = it[val]
-        if reads == 'ptr32' and val > 0:
-            fo = val - base if base else val
-            e["file_off"] = f"0x{fo:X}"
-            if 0 <= fo < len(data):
-                e["peek"] = ' '.join(f'{b:02X}' for b in data[fo:fo + 16])
-        res.append(e)
-    out = {"path": path, "offset": f"0x{offset:X}", "type": reads, "count": len(res)}
-    if len(res) == 1: out.update(res[0])
-    else: out["values"] = res
-    return out
 
 
-async def decipher(path: str, offset: int = 0, length: int = None, decompress: bool = True,
-                   reads: str = None, count: int = 1, xor: str = None,
-                   endian: str = "little", stride: int = 0, base: int = 0) -> dict:
-    """Read and decode. reads= for structured binary (u8/u16/u32/s8/s16/s32/ptr32/text). Supports xor=, stride=, base=."""
+async def decipher(path: str, offset: int = 0, length: int = None, decompress: bool = True) -> dict:
+    """Read and decode files. Auto-decompresses and auto-decodes known structures (trainers, pokemon, encounters, etc.)."""
     # Multi-file: comma-separated paths
     if "," in path:
         results = []
         for p in path.split(","):
             p = p.strip()
             if p:
-                results.append(await decipher(p, offset, length, decompress, reads, count, xor, endian, stride, base))
+                results.append(await decipher(p, offset, length, decompress))
         return {"multi": True, "results": results}
 
     if not current_rom:
@@ -3212,7 +4248,7 @@ async def decipher(path: str, offset: int = 0, length: int = None, decompress: b
     if gc_prefix and gc_prefix != current_rom['header']['game_code']:
         orig_gc = _switch_rom(gc_prefix)
         try:
-            result = await decipher(clean_path, offset, length, decompress, reads, count, xor, endian, stride, base)
+            result = await decipher(clean_path, offset, length, decompress)
         finally:
             _switch_rom(orig_gc)
         return result
@@ -3229,6 +4265,13 @@ async def decipher(path: str, offset: int = 0, length: int = None, decompress: b
             elif path.lower() == 'arm7.bin':
                 data = bytes(current_rom['arm7_data'])
                 compression = 'none'
+            elif _is_overlay_path(path) >= 0:
+                ov_id = _is_overlay_path(path)
+                overlays = current_rom.get('overlays', {})
+                if ov_id not in overlays:
+                    return {"error": f"Overlay {ov_id} not found (available: {sorted(overlays.keys())})"}
+                data = bytes(overlays[ov_id])
+                compression = 'none'  # already decompressed during load
             elif ':' in path:
                 narc_path, file_idx = path.rsplit(':', 1)
                 file_idx = int(file_idx)
@@ -3253,10 +4296,20 @@ async def decipher(path: str, offset: int = 0, length: int = None, decompress: b
                 data = data[offset:offset + length]
             elif offset:
                 data = data[offset:]
-
-            if reads:
-                return _structured_read(path, data, offset, reads, count, xor, endian, stride, base)
-            result = {"path": path, "size": len(data), "compression": compression, "hex": _format_hex(data, offset), "decoded": _auto_decode(path, data)}
+            decoded = _auto_decode(path, data)
+            _path_notes = _notes_for_path(path)
+            result = {"path": path, "size": len(data), "compression": compression, "decoded": decoded}
+            if _path_notes:
+                result["known"] = _path_notes
+            if isinstance(decoded, dict) and decoded.get("_unknown"):
+                result["status"] = f"not decoded: {decoded['reason']}"
+                result["hint"] = decoded.get("hint", "")
+                result["hex"] = _format_hex(data[offset:min(len(data), offset+128)], offset)
+                result["hex_note"] = f"first 128B shown — call scope({path}) for full dump"
+            elif decoded is None:
+                result["status"] = "not decoded: role known but decoder returned nothing"
+                result["hex"] = _format_hex(data[offset:min(len(data), offset+128)], offset)
+                result["hex_note"] = f"first 128B shown — call scope({path}) for full dump"
             return result
 
         except Exception as e:
@@ -3273,6 +4326,121 @@ async def sketch(path: str, data: str, offset: int = 0, encoding: str = "hex") -
     """Write data to a file."""
     if not current_rom:
         return {"error": "No ROM currently open"}
+
+    if encoding == "png":
+        # PNG → NDS tile data (NCGR/NCLR/NSCR triplet)
+        # Input: base64-encoded PNG, or file path on disk
+        # Output: appended as 3 consecutive NARC files (tiles, palette, map)
+        try:
+            import base64
+            from PIL import Image
+            import io
+
+            # Load image from base64 or file path
+            if os.path.isfile(data):
+                img = Image.open(data).convert('RGBA')
+            else:
+                img = Image.open(io.BytesIO(base64.b64decode(data))).convert('RGBA')
+
+            # Quantize to 16 colors (NDS palette limit)
+            # Convert RGBA to RGB for quantization, preserve alpha as transparency
+            rgb = img.convert('RGB')
+            quantized = rgb.quantize(colors=16, method=Image.Quantize.MEDIANCUT)
+            palette_data = quantized.getpalette()[:16 * 3]  # 16 colors × RGB
+            pixel_indices = list(quantized.getdata())
+            w, h = img.size
+
+            # Build NDS 15-bit palette (NCLR)
+            # Format: XBBBBBGGGGGRRRRR (little-endian u16)
+            nds_palette = bytearray(16 * 2)
+            # Slot 0 = transparent
+            for i in range(16):
+                r, g, b = palette_data[i*3], palette_data[i*3+1], palette_data[i*3+2]
+                r5 = (r >> 3) & 0x1F
+                g5 = (g >> 3) & 0x1F
+                b5 = (b >> 3) & 0x1F
+                c16 = r5 | (g5 << 5) | (b5 << 10)
+                struct.pack_into('<H', nds_palette, i * 2, c16)
+
+            # Build NCLR file (palette)
+            nclr_data_size = len(nds_palette)
+            # NCLR header: magic(4) + BOM(2) + version(2) + filesize(4) + headersize(2) + sections(2)
+            # PLTT section: magic(4) + size(4) + depth(4) + padding(4) + datasize(4) + offset(4) + data
+            pltt_size = 24 + nclr_data_size
+            nclr_size = 16 + pltt_size
+            nclr = bytearray(nclr_size)
+            struct.pack_into('<4sHHIHH', nclr, 0, b'RLCN', 0xFEFF, 0x0100, nclr_size, 16, 1)
+            struct.pack_into('<4sIIIII', nclr, 16, b'TTLP', pltt_size, 4, 0, nclr_data_size, 0)
+            nclr[40:40 + nclr_data_size] = nds_palette
+
+            # Build tile data (NCGR) — 8×8 pixel tiles, 4bpp (2 pixels per byte)
+            tiles_w = (w + 7) // 8
+            tiles_h = (h + 7) // 8
+            tile_data = bytearray(tiles_w * tiles_h * 32)  # 32 bytes per 8×8 4bpp tile
+            for ty in range(tiles_h):
+                for tx in range(tiles_w):
+                    tile_off = (ty * tiles_w + tx) * 32
+                    for py in range(8):
+                        for px in range(0, 8, 2):
+                            ix = tx * 8 + px
+                            iy = ty * 8 + py
+                            lo = pixel_indices[iy * w + ix] if ix < w and iy < h else 0
+                            hi = pixel_indices[iy * w + ix + 1] if ix + 1 < w and iy < h else 0
+                            lo = min(lo, 15)
+                            hi = min(hi, 15)
+                            tile_data[tile_off + py * 4 + px // 2] = (lo & 0xF) | ((hi & 0xF) << 4)
+
+            # NCGR header
+            char_data_size = len(tile_data)
+            char_size = 32 + char_data_size
+            ncgr_size = 16 + char_size
+            ncgr = bytearray(ncgr_size)
+            struct.pack_into('<4sHHIHH', ncgr, 0, b'RGCN', 0xFEFF, 0x0101, ncgr_size, 16, 1)
+            struct.pack_into('<4sIHHIII', ncgr, 16, b'RAHC', char_size, tiles_h, tiles_w, 3, 0, char_data_size)
+            ncgr[48:48 + char_data_size] = tile_data
+
+            # Build screen map (NSCR) — sequential tile indices
+            map_entries = tiles_w * tiles_h
+            map_data = bytearray(map_entries * 2)
+            for i in range(map_entries):
+                struct.pack_into('<H', map_data, i * 2, i)  # sequential, no flip/palette
+
+            # NSCR header
+            scrn_data_size = len(map_data)
+            scrn_size = 20 + scrn_data_size
+            nscr_size = 16 + scrn_size
+            nscr = bytearray(nscr_size)
+            struct.pack_into('<4sHHIHH', nscr, 0, b'RCSN', 0xFEFF, 0x0100, nscr_size, 16, 1)
+            struct.pack_into('<4sIHHI', nscr, 16, b'NRCS', scrn_size, w, h, scrn_data_size)
+            nscr[36:36 + scrn_data_size] = map_data
+
+            # Write as 3 consecutive appends to the NARC
+            if ':' not in path:
+                return {"error": "PNG encoding requires a NARC path (e.g. a/2/6/7:append)"}
+
+            narc_path, idx_str = path.rsplit(':', 1)
+            narc = _get_narc(narc_path.lstrip('/'))
+            rom = current_rom['rom']
+            base_idx = len(narc.files)
+
+            narc.files.append(bytes(ncgr))
+            narc.files.append(bytes(nclr))
+            narc.files.append(bytes(nscr))
+            rom.setFileByName(narc_path.lstrip('/'), narc.save())
+            _invalidate_narc(narc_path.lstrip('/'))
+
+            return {
+                "converted": True, "source": "png", "image_size": f"{w}x{h}",
+                "colors": 16, "tiles": f"{tiles_w}x{tiles_h}",
+                "narc": narc_path,
+                "ncgr_index": base_idx, "nclr_index": base_idx + 1, "nscr_index": base_idx + 2,
+                "total_files": len(narc.files),
+                "sizes": {"ncgr": len(ncgr), "nclr": len(nclr), "nscr": len(nscr)}
+            }
+        except ImportError:
+            return {"error": "Pillow not installed — pip install Pillow"}
+        except Exception as e:
+            return {"error": f"PNG conversion failed: {e}"}
 
     if encoding == "hex":
         clean_hex = data.replace(' ', '').replace('\n', '').replace('\t', '').replace('\r', '')
@@ -3296,12 +4464,29 @@ async def sketch(path: str, data: str, offset: int = 0, encoding: str = "hex") -
             elif path.lower() == 'arm7.bin':
                 current_rom['arm7_data'][offset:offset + len(data_bytes)] = data_bytes
                 return {"written": len(data_bytes), "path": path, "offset": offset}
+            elif _is_overlay_path(path) >= 0:
+                ov_id = _is_overlay_path(path)
+                overlays = current_rom.get('overlays', {})
+                if ov_id not in overlays:
+                    return {"error": f"Overlay {ov_id} not found (available: {sorted(overlays.keys())})"}
+                overlays[ov_id][offset:offset + len(data_bytes)] = data_bytes
+                return {"written": len(data_bytes), "path": path, "offset": offset, "overlay_id": ov_id}
 
             if ':' in path:
-                narc_path, file_idx = path.rsplit(':', 1)
-                file_idx = int(file_idx)
+                narc_path, file_idx_str = path.rsplit(':', 1)
                 narc = _get_narc(narc_path.lstrip('/'))
 
+                # NARC append mode: sketch("a/0/5/5:append", data)
+                if file_idx_str.lower() == 'append':
+                    new_idx = len(narc.files)
+                    narc.files.append(bytes(data_bytes))
+                    rom.setFileByName(narc_path.lstrip('/'), narc.save())
+                    _invalidate_narc(narc_path.lstrip('/'))
+                    return {"appended": True, "path": path, "narc": narc_path,
+                            "new_index": new_idx, "size": len(data_bytes),
+                            "total_files": len(narc.files)}
+
+                file_idx = int(file_idx_str)
                 current_file = bytearray(narc.files[file_idx])
                 current_file[offset:offset + len(data_bytes)] = data_bytes
                 narc.files[file_idx] = bytes(current_file)
@@ -3338,7 +4523,6 @@ async def record(output_path: str) -> dict:
 
     # Recompress ARM9
     try:
-        import tempfile
         arm9_data = bytes(current_rom['arm9_data'])
         with tempfile.NamedTemporaryFile(delete=False, suffix='.bin') as tmp:
             tmp.write(arm9_data)
@@ -3351,6 +4535,24 @@ async def record(output_path: str) -> dict:
         rom.arm9 = bytes(current_rom['arm9_data'])
 
     rom.arm7 = bytes(current_rom['arm7_data'])
+
+    # Write modified overlays back to ROM files
+    overlays = current_rom.get('overlays', {})
+    if overlays:
+        try:
+            parsed_ovs = rom.loadArm9Overlays()
+            for ov_id, ov_data in overlays.items():
+                if ov_id in parsed_ovs:
+                    file_id = parsed_ovs[ov_id].fileID
+                    # Re-compress with LZ10 (matching original compression)
+                    try:
+                        compressed = ndspy.lz10.compress(bytes(ov_data))
+                        rom.files[file_id] = compressed
+                    except Exception:
+                        rom.files[file_id] = bytes(ov_data)
+        except Exception:
+            pass
+
     rom.saveToFile(output_path)
 
     return {"saved": output_path}
@@ -3380,6 +4582,12 @@ async def scope(path: str = None, offset: int = 0, length: int = 256, search: st
                 data = bytes(current_rom['arm9_data'])
             elif path.lower() == 'arm7.bin':
                 data = bytes(current_rom['arm7_data'])
+            elif _is_overlay_path(path) >= 0:
+                ov_id = _is_overlay_path(path)
+                overlays = current_rom.get('overlays', {})
+                if ov_id not in overlays:
+                    return {"error": f"Overlay {ov_id} not found (available: {sorted(overlays.keys())})"}
+                data = bytes(overlays[ov_id])
             elif ':' in path:
                 narc_path, file_idx = path.rsplit(':', 1)
                 file_idx = int(file_idx)
@@ -3412,6 +4620,24 @@ async def scope(path: str = None, offset: int = 0, length: int = 256, search: st
 
     result = {"offset": offset, "length": len(dump_data), "dump": '\n'.join(hex_lines)}
 
+    # Auto-disassemble ARM9, ARM7, and overlay paths
+    if path and _cs_arm is not None:
+        is_code = path.lower() in ('arm9.bin', 'arm7.bin') or _is_overlay_path(path) >= 0
+        if is_code:
+            # NDS ARM9 loads at 0x02000000; use that as base address
+            base_addr = 0x02000000 + offset
+            # Try Thumb first (more common in NDS), fall back to ARM
+            disasm_lines = []
+            for cs, mode_name in [(_cs_thumb, 'thumb'), (_cs_arm, 'arm')]:
+                test = list(cs.disasm(bytes(dump_data[:8]), base_addr))
+                if test:
+                    for insn in cs.disasm(bytes(dump_data), base_addr):
+                        disasm_lines.append(f"  0x{insn.address:08X}:  {insn.mnemonic:8s} {insn.op_str}")
+                    result["disasm_mode"] = mode_name
+                    break
+            if disasm_lines:
+                result["disasm"] = '\n'.join(disasm_lines)
+
     if search:
         search_bytes = bytes.fromhex(search.replace(' ', ''))
         results = []
@@ -3428,7 +4654,7 @@ async def scope(path: str = None, offset: int = 0, length: int = 256, search: st
 
 
 
-async def dowse(narc_path: str = None, hex: str = None, name: str = None, table: str = None, exact: bool = False) -> dict:
+async def dowse(narc_path: str = None, hex: str = None, name: str = None, table: str = None, exact: bool = False, difficulty: str = None) -> dict:
     """Search NARC files by hex pattern, or look up text table entries by name.
     
     Modes:
@@ -3437,6 +4663,8 @@ async def dowse(narc_path: str = None, hex: str = None, name: str = None, table:
       - hex + narc_path: find files in NARC containing hex pattern
       - hex (no narc_path): search ALL loaded NARCs (slow but thorough)
       - exact=True: match whole string, not substring
+      - difficulty: filter trdata matches by difficulty mode ('normal', 'challenge', 'easy')
+        BW2 only. Groups results by pokemon count across file clusters -- no hardcoded indices.
     """
     if not current_rom:
         return {"error": "No ROM currently open"}
@@ -3472,8 +4700,140 @@ async def dowse(narc_path: str = None, hex: str = None, name: str = None, table:
                 else:
                     if query in entry.lower():
                         results.append({"table": tbl_name, "index": idx, "name": entry})
+            # Auto-resolve trainer_classes hits → trdata files via class ID byte
+            class_hits = [r for r in results if r.get('table') == 'trainer_classes']
+            if class_hits and current_rom:
+                try:
+                    gc = current_rom.get('header', {}).get('game_code', '')
+                    trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
+                    if trdata_path:
+                        td_files = _get_narc(trdata_path).files
+                        for ch in class_hits:
+                            cid = ch['index']
+                            for fi, td in enumerate(td_files):
+                                if len(td) >= 2 and td[1] == cid:
+                                    results.append({'table': 'trdata', 'index': fi, 'name': ch['name']})
+                except Exception:
+                    pass
         if not narc_path:
-            return {"query": name, "exact": exact, "matches": results, "count": len(results)}
+            # Role/category search: if no text table hits, check narc_roles and eonet_labels
+            if not results and current_rom:
+                gc = current_rom['header']['game_code']
+                role_hits = []
+                for narc_p, role in narc_roles.items():
+                    if query in role.replace('_', ' ') or query in narc_p:
+                        from ndspy.narc import NARC as _NARC
+                        try:
+                            fc = len(_get_narc(narc_p).files)
+                        except Exception:
+                            fc = '?'
+                        role_hits.append({"path": narc_p, "role": role, "files": fc})
+                # Also search eonet_labels desc
+                for narc_p, info in eonet_labels.get(gc, {}).items():
+                    if isinstance(info, dict) and query in info.get('desc', '').lower():
+                        if not any(h['path'] == narc_p for h in role_hits):
+                            role_hits.append({"path": narc_p, "role": info['desc'], "files": info.get('meta', {}).get('file_count', '?')})
+                if role_hits:
+                    return {"query": name, "category_matches": role_hits, "count": len(role_hits)}
+            result = {"query": name, "exact": exact, "matches": results, "count": len(results)}
+
+            # Difficulty filtering for Gen V BW2 (Challenge/Easy/Normal modes).
+            # Groups trdata matches into clusters (consecutive file indices = same difficulty block),
+            # then labels them by pokemon count: fewest = Easy, most = Challenge, middle = Normal.
+            # No hardcoded file ranges -- derived from the data itself.
+            if difficulty and gen == 5 and results:
+                trdata_hits = [r for r in results if r.get('table') == 'trdata']
+                other_hits  = [r for r in results if r.get('table') != 'trdata']
+                if trdata_hits:
+                    # Group by cluster: new cluster when gap > 20 file indices
+                    trdata_hits.sort(key=lambda r: r['index'])
+                    clusters = []
+                    cur = [trdata_hits[0]]
+                    for r in trdata_hits[1:]:
+                        if r['index'] - cur[-1]['index'] <= 20:
+                            cur.append(r)
+                        else:
+                            clusters.append(cur)
+                            cur = [r]
+                    clusters.append(cur)
+                    # Get median npoke per cluster by probing trdata
+                    try:
+                        gc = current_rom.get('header', {}).get('game_code', '')
+                        trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
+                        def _cluster_npoke(cluster):
+                            files = _get_narc(trdata_path).files
+                            counts = [files[r['index']][3] for r in cluster if r['index'] < len(files) and len(files[r['index']]) >= 4]
+                            return sum(counts) / max(len(counts), 1)
+                        scored = sorted(clusters, key=_cluster_npoke)
+                        # scored[0]=fewest pokemon=Easy, scored[-1]=most=Challenge, middle=Normal
+                        label_map = {'easy': 0, 'normal': len(scored)//2, 'challenge': -1}
+                        pick = label_map.get(difficulty.lower())
+                        if pick is not None:
+                            chosen = scored[pick]
+                            results = other_hits + chosen
+                            result['matches'] = results
+                            result['count'] = len(results)
+                            result['difficulty'] = difficulty.lower()
+                    except Exception:
+                        pass
+
+            # Canonical rival name lookup -- fires whenever a search matches a known
+            # rival by their English default name, regardless of hit count.
+            # These are player-named so they never appear in trainer_names under
+            # their canonical names; searching them always surfaces the right files.
+            # Maps canonical rival/special names to trainer class IDs.
+            # File indices are derived at query time by scanning loaded trdata -- nothing hardcoded.
+            RIVAL_LOOKUP = {
+                'silver': {'canonical': 'Silver', 'class_ids': [23],
+                           'note': 'Player-named rival (HGSS). Class 23 = Rival.'},
+                'barry':  {'canonical': 'Barry',  'class_ids': [95, 96],
+                           'note': 'Player-named rival (DP/Pt). Class 95 vs male player, 96 vs female. Not in trainer_names.'},
+                'hugh':   {'canonical': 'Hugh',   'class_ids': [145],
+                           'note': 'Player-named rival (BW2). Stored as placeholder in trainer_names. 3 files/encounter = one per starter; 6 files = 3 starters x 2 genders (Nate/Rosa).'},
+            }
+            rival = RIVAL_LOOKUP.get(query.strip().lower())
+            if rival and current_rom:
+                try:
+                    gc = current_rom.get('header', {}).get('game_code', '')
+                    trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
+                    if trdata_path:
+                        td_files = _get_narc(trdata_path).files
+                        for fi, td in enumerate(td_files):
+                            if len(td) >= 2 and td[1] in rival['class_ids']:
+                                results.append({'table': 'trdata', 'index': fi, 'name': rival['canonical']})
+                        result['count'] = len(results)
+                except Exception:
+                    pass
+
+            # If nothing found and trainer_names was in scope, check trainer_classes
+            # and explain why rivals won't appear in trainer_names
+            if len(results) == 0 and (not table or table == 'trainer_names'):
+                if 'trainer_names' in text_tables and 'trainer_classes' in text_tables:
+                    class_hits = []
+                    for idx, entry in enumerate(text_tables['trainer_classes']):
+                        if isinstance(entry, str) and query in entry.lower():
+                            class_hits.append({"table": "trainer_classes", "index": idx, "name": entry})
+                    if class_hits:
+                        result['trainer_class_matches'] = class_hits
+                        result['note'] = (
+                            "Not found in trainer_names. Player-named rivals have no entry there "
+                            "because the player sets their name at the start of the game "
+                            "(this has been true since Blue/Gary in Gen 1). "
+                            "They appear in trainer_classes only (shown above). "
+                            "Dawn and Lucas are exceptions: they are the unchosen player character "
+                            "whose name is fixed by the game, so they DO appear in trainer_names. "
+                            "Rival battle trdata locations by game: "
+                            "HGSS (Silver): a/0/5/5 files [1,2,3,263-272,285-289,489-491,735-737] (class 23 = Rival). "
+                            "Diamond/Platinum (Barry): poketool/trainer/trdata.narc files "
+                            "[613-615,621-623] vs male player, [616-618,624-626] vs female player "
+                            "(classes 95/96 = blank Trainer, same indices in both games). "
+                            "BW2 (Hugh): a/0/9/1 files "
+                            "[161-163,166-168,368-370,378-380,588-590,684-686,693-698,701-703,794-796] "
+                            "(class 145 = blank Trainer; stored as 'Rival' in trainer_names; "
+                            "3 files per encounter = one per starter counter, "
+                            "6 files = 3 starters x 2 player genders Nate/Rosa)."
+                        )
+            return result
         
         # name + narc_path: resolve matches to IDs, search NARC for those IDs as LE u16
         try:
@@ -3489,34 +4849,55 @@ async def dowse(narc_path: str = None, hex: str = None, name: str = None, table:
                     narc_hits.append({"file": f"{narc_path}:{fidx}", "name": match["name"], "id": sid})
         return {"query": name, "narc": narc_path, "text_matches": results, "narc_matches": narc_hits, "count": len(narc_hits)}
     
-    # Hex pattern search in NARC
+    # Hex pattern search
     if hex:
         if current_rom["type"] != "nds":
             return {"error": "Hex search only supported for NDS"}
-        rom = current_rom["rom"]
+        if not narc_path:
+            return {"error": "Provide narc_path, arm9.bin, arm7.bin, or overlayN.bin"}
         search_bytes = bytes.fromhex(hex.replace(" ", ""))
+
+        # ARM9 / ARM7
+        if narc_path.lower() in ("arm9.bin", "arm7.bin"):
+            data = bytes(current_rom["arm9_data"] if narc_path.lower() == "arm9.bin" else current_rom["arm7_data"])
+            offsets, pos = [], 0
+            while True:
+                pos = data.find(search_bytes, pos)
+                if pos < 0: break
+                offsets.append(f"0x{pos:X}")
+                pos += 1
+            return {"pattern": hex, "path": narc_path, "matches": offsets, "count": len(offsets)}
+
+        # Overlay
+        ov_id = _is_overlay_path(narc_path)
+        if ov_id >= 0:
+            overlays = current_rom.get("overlays", {})
+            if ov_id not in overlays:
+                return {"error": f"Overlay {ov_id} not found (available: {sorted(overlays.keys())})"}
+            data = bytes(overlays[ov_id])
+            offsets, pos = [], 0
+            while True:
+                pos = data.find(search_bytes, pos)
+                if pos < 0: break
+                offsets.append(f"0x{pos:X}")
+                pos += 1
+            return {"pattern": hex, "path": narc_path, "matches": offsets, "count": len(offsets)}
+
+        # NARC
+        try:
+            narc = _get_narc(narc_path.lstrip("/"))
+        except Exception as e:
+            return {"error": f"Could not open NARC: {e}"}
         results = []
-        
-        if narc_path:
-            # Search specific NARC
-            try:
-                narc = _get_narc(narc_path.lstrip("/"))
-            except Exception as e:
-                return {"error": f"Could not open NARC: {e}"}
-            for idx, fdata in enumerate(narc.files):
-                pos = 0
-                offsets = []
-                while True:
-                    pos = fdata.find(search_bytes, pos)
-                    if pos == -1:
-                        break
-                    offsets.append(pos)
-                    pos += 1
-                if offsets:
-                    results.append({"file": f"{narc_path}:{idx}", "offsets": offsets})
-        else:
-            return {"error": "Provide narc_path for hex search"}
-        
+        for idx, fdata in enumerate(narc.files):
+            offsets, pos = [], 0
+            while True:
+                pos = fdata.find(search_bytes, pos)
+                if pos < 0: break
+                offsets.append(pos)
+                pos += 1
+            if offsets:
+                results.append({"file": f"{narc_path}:{idx}", "offsets": offsets})
         return {"pattern": hex, "narc": narc_path, "matches": results, "count": len(results)}
     
     return {"error": "Provide either name (text lookup) or hex (hex search)"}
@@ -3549,6 +4930,12 @@ async def judgement(path_a: str, path_b: str) -> dict:
             return bytes(current_rom['arm9_data'])
         elif p.lower() == 'arm7.bin':
             return bytes(current_rom['arm7_data'])
+        elif _is_overlay_path(p) >= 0:
+            ov_id = _is_overlay_path(p)
+            overlays = current_rom.get('overlays', {})
+            if ov_id not in overlays:
+                raise ValueError(f"Overlay {ov_id} not found (available: {sorted(overlays.keys())})")
+            return bytes(overlays[ov_id])
         elif ':' in p:
             narc_path, file_idx = p.rsplit(':', 1)
             file_idx = int(file_idx)
@@ -3565,94 +4952,137 @@ async def judgement(path_a: str, path_b: str) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
-    differences = []
     max_len = max(len(data_a), len(data_b))
-
+    raw_diffs = []
     for i in range(max_len):
-        byte_a = data_a[i] if i < len(data_a) else None
-        byte_b = data_b[i] if i < len(data_b) else None
+        ba = data_a[i] if i < len(data_a) else None
+        bb = data_b[i] if i < len(data_b) else None
+        if ba != bb:
+            raw_diffs.append((i, ba, bb))
 
-        if byte_a != byte_b:
-            differences.append({
-                "offset": i,
-                "a": f"{byte_a:02X}" if byte_a is not None else "N/A",
-                "b": f"{byte_b:02X}" if byte_b is not None else "N/A"
-            })
+    # Group into consecutive ranges
+    ranges = []
+    for off, ba, bb in raw_diffs:
+        if ranges and off == ranges[-1]['end'] + 1:
+            ranges[-1]['end'] = off
+            ranges[-1]['count'] += 1
+        else:
+            ranges.append({"start": off, "end": off, "count": 1,
+                           "a": f"{ba:02X}" if ba is not None else "N/A",
+                           "b": f"{bb:02X}" if bb is not None else "N/A"})
+
+    # Summarise each range
+    diff_summary = []
+    for r in ranges[:50]:
+        s = f"0x{r['start']:X}"
+        if r['count'] > 1: s += f"-0x{r['end']:X} ({r['count']} bytes)"
+        diff_summary.append({"range": s, "a": r['a'], "b": r['b']})
 
     return {
-        "identical": len(differences) == 0,
-        "size_a": len(data_a),
-        "size_b": len(data_b),
-        "difference_count": len(differences),
-        "differences": differences[:100]
+        "identical": not raw_diffs,
+        "size_a": len(data_a), "size_b": len(data_b),
+        "diff_regions": len(ranges),
+        "diff_bytes": len(raw_diffs),
+        "differences": diff_summary
     }
 
 
 
 async def stats() -> dict:
-    """Show honest documentation coverage statistics."""
+    """Coverage: how much of the ROM the server can decode and has indexed."""
     if not current_rom:
-        return {"error": "No ROM currently open"}
-    
-    if not current_flipnote:
-        return {"error": "No flipnote loaded"}
-    
-    fpn = current_flipnote['data']
-    notes = fpn.get('notes', {})
-    rom_stats = fpn.get('rom_stats', {})
-    tree = fpn.get('tree', [])
-
-    # Count files in tree (excluding folders)
-    total_files = len([p for p in tree if not p.endswith('/')])
-    narc_internal = len([p for p in tree if ':' in p])
-    top_level_files = total_files - narc_internal
-
-    # Count documented paths
-    documented = len(notes)
-
-    # Calculate byte coverage (rough estimate)
+        # Still show server status even without a ROM
+        eonet_status = {}
+        try:
+            proxy_log = Path.home() / ".linkplay" / "eonet_proxy.log"
+            pid_file = Path.home() / ".linkplay" / "eonet_proxy.pid"
+            eonet_status["proxy_pid_file"] = pid_file.exists()
+            if pid_file.exists():
+                pid = int(pid_file.read_text().strip())
+                try:
+                    os.kill(pid, 0)
+                    eonet_status["proxy_alive"] = True
+                except OSError:
+                    eonet_status["proxy_alive"] = False
+                eonet_status["proxy_pid"] = pid
+            if proxy_log.exists():
+                lines = proxy_log.read_text(encoding='utf-8', errors='ignore').strip().split('\n')
+                eonet_status["last_log"] = lines[-3:] if len(lines) >= 3 else lines
+        except Exception:
+            eonet_status["error"] = "could not check"
+        return {
+            "status": "no ROM loaded",
+            "loaded_roms": list(loaded_roms.keys()),
+            "eonet": eonet_status,
+        }
+    gc = current_rom['header']['game_code']
+    fpn_notes = current_flipnote['data'].get('notes', {}) if current_flipnote else {}
+    rom_stats = current_flipnote['data'].get('rom_stats', {}) if current_flipnote else {}
     total_bytes = rom_stats.get('total_bytes', 0)
-    arm9_size = rom_stats.get('arm9_size', 0)
 
-    # Count arm9 regions documented (look for arm9 in notes)
-    arm9_notes = [n for n in notes.keys() if 'arm9' in n.lower()]
-    arm9_documented_bytes = 0
-    for note_path in arm9_notes:
-        # Try to extract byte count from description
-        note_data = notes[note_path]
-        desc = note_data.get('description', '')
-        # Look for patterns like "180 bytes" or "172 bytes"
-        import re
-        match = re.search(r'(\d+)\s*bytes?', desc, re.IGNORECASE)
-        if match:
-            arm9_documented_bytes += int(match.group(1))
+    # ICR index coverage
+    index = eonet_index.get(gc, [])
+    labels = eonet_labels.get(gc, {})
+    roles = narc_roles
 
-    # Count files with actual structure documented (have 'format' or 'structure' field)
-    structured = len([n for n in notes.values() if n.get('format') or n.get('structure')])
+    indexed_narcs = len([k for k in labels if k != '_cross_refs' and ':' not in k])
+    indexed_files = len(index)
+    role_counts = {}
+    for path, role in roles.items():
+        role_counts[role] = role_counts.get(role, 0) + 1
 
-    files_percent = f"{(documented / top_level_files * 100):.1f}%" if top_level_files > 0 else "0%"
-    bytes_total_human = f"{total_bytes / 1024 / 1024:.1f} MB" if total_bytes > 0 else "?"
-    arm9_percent = f"{(arm9_documented_bytes / arm9_size * 100):.3f}%" if arm9_size > 0 else "0%"
-    coverage_percent = f"{(arm9_documented_bytes / total_bytes * 100):.4f}%" if total_bytes > 0 else "0%"
+    # Flipnote notes (manual annotations)
+    manual_notes = len(fpn_notes)
+
+    # Decoded roles vs what _auto_decode handles
+    handled_roles = {
+        'trpoke', 'trdata', 'personal', 'learnsets', 'evolutions', 'move_data',
+        'encounters', 'items', 'contest', 'pokeathlon_performance',
+        'battle_tower_pokemon', 'battle_tower_trainers',
+        'subway_pokemon', 'subway_trainers',
+        'pwt_rental', 'pwt_rental_b', 'pwt_champions', 'pwt_champions_b',
+        'pwt_trainers', 'pwt_trainers_b', 'pwt_rosters', 'pwt_rosters_b',
+        'pwt_defs', 'pwt_mix', 'pwt_trainer_map',
+    }
+    decoded_roles = {r: c for r, c in role_counts.items() if r in handled_roles}
+    unknown_roles = {r: c for r, c in role_counts.items() if r not in handled_roles}
+
+    # Eonet proxy status
+    eonet_status = {}
+    try:
+        proxy_log = Path.home() / ".linkplay" / "eonet_proxy.log"
+        pid_file = Path.home() / ".linkplay" / "eonet_proxy.pid"
+        eonet_status["proxy_pid_file"] = pid_file.exists()
+        if pid_file.exists():
+            pid = int(pid_file.read_text().strip())
+            # Check if process is alive
+            import signal
+            try:
+                os.kill(pid, 0)
+                eonet_status["proxy_alive"] = True
+            except OSError:
+                eonet_status["proxy_alive"] = False
+            eonet_status["proxy_pid"] = pid
+        if proxy_log.exists():
+            # Last 3 log lines
+            lines = proxy_log.read_text(encoding='utf-8', errors='ignore').strip().split('\n')
+            eonet_status["last_log"] = lines[-3:] if len(lines) >= 3 else lines
+    except Exception:
+        eonet_status["error"] = "could not check"
 
     return {
-        "game": fpn.get('game_title', 'Unknown'),
-        "coverage": {
-            "files_labeled": documented,
-            "files_total": top_level_files,
-            "files_percent": files_percent,
-            "narc_files_total": narc_internal,
-            "files_with_structure": structured,
-            "bytes_total": total_bytes,
-            "bytes_total_human": bytes_total_human,
-            "arm9_size": arm9_size,
-            "arm9_documented_bytes": arm9_documented_bytes,
-            "arm9_percent": arm9_percent
+        "game": current_rom['header']['game_title'],
+        "rom_size": f"{total_bytes / 1024 / 1024:.1f} MB" if total_bytes else "?",
+        "loaded_roms": list(loaded_roms.keys()),
+        "icr": {
+            "narcs_indexed": indexed_narcs,
+            "files_indexed": indexed_files,
+            "status": "cached" if indexed_files > 0 else "not built yet",
         },
-        "honest_assessment": (
-            f"You've labeled {documented} paths but most are just descriptions, not real documentation. "
-            f"Real byte-level understanding: ~{arm9_documented_bytes} bytes out of {total_bytes:,} ({coverage_percent})"
-        )
+        "decoded_roles": decoded_roles,
+        "unknown_roles": unknown_roles,
+        "manual_notes": manual_notes,
+        "eonet": eonet_status,
     }
 
 
@@ -3682,30 +5112,31 @@ async def list_flipnotes() -> dict:
     return {"flipnotes": flipnotes}
 
 
-async def view_flipnote(game: str) -> dict:
-    """View a Flipnote's contents."""
+async def view_flipnote(game: str, search: str = None, summary: bool = False) -> dict:
+    """View a Flipnote. search= filters notes by path/description. summary=True returns note count + paths only."""
     ensure_dirs()
-
     for fpn in flipnotes_dir.glob("*.fpn"):
         try:
             with open(fpn, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                codes = data.get('game_codes', [])
-                if not codes:
-                    codes = [data.get('game_code', '')]
-                title_lower = data.get('game_title', '').lower()
-                words_match = all(w in title_lower for w in game.lower().split())
-                if game in codes or words_match:
-                    return {
-                        "game_codes": codes,
-                        "game_title": data.get("game_title"),
+            codes = data.get('game_codes', []) or [data.get('game_code', '')]
+            title_lower = data.get('game_title', '').lower()
+            if game not in codes and not all(w in title_lower for w in game.lower().split()):
+                continue
+            notes = data.get('notes', {})
+            if search:
+                q = search.lower()
+                notes = {k: v for k, v in notes.items()
+                         if q in k.lower() or q in (v.get('description', '') if isinstance(v, dict) else str(v)).lower()}
+            if summary:
+                return {"game_codes": codes, "game_title": data.get("game_title"),
                         "region_codes": data.get("region_codes", {}),
-                        "note_count": len(data.get("notes", {})),
-                        "notes": data.get("notes", {})
-                    }
+                        "note_count": len(notes), "paths": list(notes.keys())}
+            return {"game_codes": codes, "game_title": data.get("game_title"),
+                    "region_codes": data.get("region_codes", {}),
+                    "note_count": len(notes), "notes": notes}
         except:
             continue
-
     return {"error": f"Flipnote not found for: {game}"}
 
 
@@ -3794,12 +5225,13 @@ async def batch_notes(notes: list, game: str = None) -> dict:
         if n.get('file_range'): entry['file_range'] = n['file_range']
         if n.get('related'): entry['related'] = n['related']
         fpn_data['notes'][p] = entry
+        _log_note(path=p, description=d, name=n.get('name'), format=n.get('format'),
+                  tags=n.get('tags'), file_range=n.get('file_range'), related=n.get('related'))
         written += 1
 
     with open(target_path, 'w', encoding='utf-8') as f:
         json.dump(fpn_data, f, indent=2, ensure_ascii=False)
 
-    # Update in-memory if writing to current flipnote
     if not game and current_flipnote:
         current_flipnote['data'] = fpn_data
 
@@ -3807,15 +5239,21 @@ async def batch_notes(notes: list, game: str = None) -> dict:
 
 
 async def edit_note(path: str, description: str = None, name: str = None, format: str = None,
-                    tags: list = None, file_range: str = None, examples: list = None, related: list = None) -> dict:
+                    tags: list = None, file_range: str = None, examples: list = None,
+                    related: list = None, game: str = None) -> dict:
     """Edit an existing note in the Flipnote."""
-    if not current_rom:
-        return {"error": "No ROM currently open"}
-    
-    if not current_flipnote:
-        return {"error": "No flipnote loaded"}
-    
-    fpn_data = current_flipnote['data']
+    if game:
+        fpn_path = find_flipnote(game)
+        if not fpn_path: return {"error": f"No flipnote for game: {game}"}
+        with open(fpn_path, 'r', encoding='utf-8') as f: fpn_data = json.load(f)
+        save_path = fpn_path
+        in_memory = False
+    elif current_flipnote:
+        fpn_data = current_flipnote['data']
+        save_path = current_flipnote['path']
+        in_memory = True
+    else:
+        return {"error": "No ROM open and no game specified"}
 
     if path not in fpn_data['notes']:
         return {"error": f"Note not found: {path}"}
@@ -3828,30 +5266,33 @@ async def edit_note(path: str, description: str = None, name: str = None, format
     if examples is not None: fpn_data['notes'][path]["examples"] = examples
     if related is not None: fpn_data['notes'][path]["related"] = related
 
-    with open(current_flipnote['path'], 'w', encoding='utf-8') as f:
+    with open(save_path, 'w', encoding='utf-8') as f:
         json.dump(fpn_data, f, indent=2, ensure_ascii=False)
-
+    if in_memory: current_flipnote['data'] = fpn_data
     return {"edited": path}
 
 
-async def delete_note(path: str) -> dict:
+async def delete_note(path: str, game: str = None) -> dict:
     """Delete a note from the Flipnote."""
-    if not current_rom:
-        return {"error": "No ROM currently open"}
-    
-    if not current_flipnote:
-        return {"error": "No flipnote loaded"}
-    
-    fpn_data = current_flipnote['data']
+    if game:
+        fpn_path = find_flipnote(game)
+        if not fpn_path: return {"error": f"No flipnote for game: {game}"}
+        with open(fpn_path, 'r', encoding='utf-8') as f: fpn_data = json.load(f)
+        save_path = fpn_path
+        in_memory = False
+    elif current_flipnote:
+        fpn_data = current_flipnote['data']
+        save_path = current_flipnote['path']
+        in_memory = True
+    else:
+        return {"error": "No ROM open and no game specified"}
 
     if path not in fpn_data['notes']:
         return {"error": f"Note not found: {path}"}
-    
     del fpn_data['notes'][path]
-
-    with open(current_flipnote['path'], 'w', encoding='utf-8') as f:
+    with open(save_path, 'w', encoding='utf-8') as f:
         json.dump(fpn_data, f, indent=2, ensure_ascii=False)
-
+    if in_memory: current_flipnote['data'] = fpn_data
     return {"deleted": path}
 
 
@@ -3882,6 +5323,12 @@ async def probe(path: str, offset: int = 0, reads: str = "u16", count: int = 1,
             data = bytes(current_rom['arm9_data'])
         elif path.lower() == 'arm7.bin':
             data = bytes(current_rom['arm7_data'])
+        elif _is_overlay_path(path) >= 0:
+            ov_id = _is_overlay_path(path)
+            overlays = current_rom.get('overlays', {})
+            if ov_id not in overlays:
+                return {"error": f"Overlay {ov_id} not found (available: {sorted(overlays.keys())})"}
+            data = bytes(overlays[ov_id])
         elif ':' in path:
             narc_path, file_idx = path.rsplit(':', 1)
             narc = _get_narc(narc_path.lstrip('/'))
@@ -3916,9 +5363,28 @@ async def probe(path: str, offset: int = 0, reads: str = "u16", count: int = 1,
     bo = '<' if endian == 'little' else '>'
     step = stride if stride > 0 else size
     results = []
-    species = text_tables.get('species', [])
-    moves_t = text_tables.get('moves', [])
-    items_t = text_tables.get('items', [])
+    # Determine annotation mode from NARC role if path is a NARC file
+    _role_hint = None
+    if ':' in path:
+        _np = path.rsplit(':', 1)[0].lstrip('/')
+        _role_hint = narc_roles.get(_np)
+    _ROLE_ANNOT = {
+        'personal': [('species', 'species', 700)],
+        'learnsets': [('moves', 'move', 600)],
+        'move_data': [('type_names', 'type', 20)],
+        'items': [('items', 'item', 800)],
+        'trdata': [('trainer_classes', 'class', 300), ('trainer_names', 'trainer', 900)],
+        'trpoke': [('species', 'species', 700), ('moves', 'move', 600), ('items', 'item', 800)],
+        'encounters': [('species', 'species', 700)],
+        'evolutions': [('species', 'species', 700), ('items', 'item', 800), ('moves', 'move', 600)],
+    }
+    _annot_tables = _ROLE_ANNOT.get(_role_hint) if _role_hint else None
+    # Fallback for arm9/unknown: annotate all
+    if _annot_tables is None and reads in ('u16', 'u32'):
+        _annot_tables = [
+            ('species', 'species', 700), ('moves', 'move', 600),
+            ('items', 'item', 800), ('trainer_names', 'trainer', 900),
+        ]
     for i in range(count):
         pos = offset + i * step
         if pos + size > len(data):
@@ -3926,13 +5392,13 @@ async def probe(path: str, offset: int = 0, reads: str = "u16", count: int = 1,
             break
         val = struct.unpack_from(f'{bo}{fmt_char}', data, pos)[0]
         entry = {"i": i, "off": f"0x{pos:X}", "val": val, "hex": f"0x{val:0{size*2}X}"}
-        if reads in ('u16', 'u32') and val > 0:
-            if val < len(species) and val < 700:
-                entry["species?"] = species[val]
-            if val < len(moves_t) and val < 600:
-                entry["move?"] = moves_t[val]
-            if val < len(items_t) and val < 800:
-                entry["item?"] = items_t[val]
+        if _annot_tables and val > 0:
+            for tname, label, cap in _annot_tables:
+                tbl = text_tables.get(tname, [])
+                if val < len(tbl) and val < cap:
+                    s = tbl[val]
+                    if isinstance(s, str) and s.strip():
+                        entry[label] = s.strip()
         if reads == 'ptr32' and val > 0:
             foff = val - base if base else val
             entry["file_off"] = f"0x{foff:X}"
@@ -3940,7 +5406,10 @@ async def probe(path: str, offset: int = 0, reads: str = "u16", count: int = 1,
                 peek = data[foff:foff + 16]
                 entry["peek"] = ' '.join(f'{b:02X}' for b in peek)
         results.append(entry)
+    _path_notes = _notes_for_path(path)
     out = {"path": path, "offset": f"0x{offset:X}", "type": reads, "count": len(results)}
+    if _path_notes:
+        out["known"] = _path_notes
     if len(results) == 1:
         out.update(results[0])
     else:
@@ -3952,6 +5421,9 @@ async def probe(path: str, offset: int = 0, reads: str = "u16", count: int = 1,
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     """Route tool calls to handler functions."""
+    # Lazy restore: load ROMs from last session on first tool call
+    if not _rom_restore_done:
+        await _do_pending_restore()
     handlers = {
         "spotlight": spotlight,
         "return": return_tool,
@@ -3968,7 +5440,8 @@ async def call_tool(name: str, arguments: dict):
         "note": note,
         "batch_notes": batch_notes,
         "edit_note": edit_note,
-        "delete_note": delete_note
+        "delete_note": delete_note,
+        "probe": probe
     }
 
     handler = handlers.get(name)
@@ -3982,12 +5455,94 @@ async def call_tool(name: str, arguments: dict):
         game_title = current_rom['header']['game_title'] if current_rom else ''
         bar = '═' * 39
 
+        def _difficulty_label(path_str):
+            """For B2W2 trdata paths, label difficulty block by clustering trainers.
+            BW1 (IRB/IRA) has no difficulty modes -- returns empty.
+            Easy Mode in B2W2 is runtime level scaling on Normal data, no separate block.
+            Challenge Mode is the only variant with actual separate trainer files.
+            Both B2 and W2 ROMs contain both Normal and Challenge blocks.
+
+            Hybrid approach:
+            - Hardcoded table for trainers with >2 files (E4, Iris) where clustering
+              cannot distinguish the Normal/Challenge axis from the Pre/Post-champion axis.
+            - Exactly-2-clusters fallback for all others (gym leaders etc.).
+              Memory Link / starter variants / rematch blocks produce 3+ clusters
+              and correctly get no label."""
+            if not current_rom or text_gen != 5:
+                return ''
+            try:
+                gc = current_rom.get('header', {}).get('game_code', '')
+                # BW1 has no difficulty modes at all
+                if gc in ('IRB', 'IRA'):
+                    return ''
+                import re as _re
+                m = _re.search(r':(\d+)$', path_str)
+                if not m:
+                    return ''
+                file_idx = int(m.group(1))
+
+                # Hardcoded labels for trainers whose file sets span >2 clusters.
+                # E4/Champion have 4 files each: Normal, Challenge, Normal Rematch, Challenge Rematch.
+                BW2_EXPLICIT_LABELS = {
+                    38:'Normal Mode | Pre-Champion',   143:'Challenge Mode | Pre-Champion',
+                    772:'Normal Mode | Post-Champion', 777:'Challenge Mode | Post-Champion',
+                    39:'Normal Mode | Pre-Champion',   144:'Challenge Mode | Pre-Champion',
+                    774:'Normal Mode | Post-Champion', 779:'Challenge Mode | Post-Champion',
+                    40:'Normal Mode | Pre-Champion',   145:'Challenge Mode | Pre-Champion',
+                    773:'Normal Mode | Post-Champion', 778:'Challenge Mode | Post-Champion',
+                    41:'Normal Mode | Pre-Champion',   146:'Challenge Mode | Pre-Champion',
+                    775:'Normal Mode | Post-Champion', 780:'Challenge Mode | Post-Champion',
+                    341:'Normal Mode | Pre-Champion',  536:'Challenge Mode | Pre-Champion',
+                    776:'Normal Mode | Post-Champion', 781:'Challenge Mode | Post-Champion',
+                }
+                if file_idx in BW2_EXPLICIT_LABELS:
+                    return BW2_EXPLICIT_LABELS[file_idx]
+
+                trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
+                if not trdata_path:
+                    return ''
+                td_files = _get_narc(trdata_path).files
+                if file_idx >= len(td_files) or len(td_files[file_idx]) < 2:
+                    return ''
+                this_class = td_files[file_idx][1]
+                # Collect all files with the same trainer class, cluster by proximity
+                same_class = [(i, td_files[i][3]) for i in range(len(td_files))
+                              if len(td_files[i]) >= 4 and td_files[i][1] == this_class]
+                if len(same_class) < 2:
+                    return ''
+                same_class.sort()
+                clusters, cur = [], [same_class[0]]
+                for item in same_class[1:]:
+                    if item[0] - cur[-1][0] <= 20:
+                        cur.append(item)
+                    else:
+                        clusters.append(cur)
+                        cur = [item]
+                clusters.append(cur)
+                # Only label when exactly 2 clusters exist (Normal + Challenge).
+                # 3+ clusters = Memory Link / rematch tiers / starter variants -- ambiguous, skip.
+                if len(clusters) != 2:
+                    return ''
+                # Sort by avg npoke: lower = Normal, higher = Challenge
+                # Easy Mode has no separate block (runtime level scaling only)
+                def avg_npoke(cl): return sum(x[1] for x in cl) / len(cl)
+                scored = sorted(clusters, key=avg_npoke)
+                labels = ['Normal Mode', 'Challenge Mode']
+                for rank, cl in enumerate(scored):
+                    if any(x[0] == file_idx for x in cl):
+                        return labels[rank]
+            except Exception:
+                pass
+            return ''
+
         def _frame(decoded_str, path_str):
             """Wrap decoded text in ═══ frame with game title and path."""
             lines = decoded_str.split('\n', 1)
             title = lines[0]
             body = lines[1] if len(lines) > 1 else ''
-            header = f"{bar}\n{title}\n{game_title} | {path_str}\n{bar}"
+            diff = _difficulty_label(path_str)
+            diff_tag = f' [{diff}]' if diff else ''
+            header = f"{bar}\n{title}{diff_tag}\n{game_title} | {path_str}\n{bar}"
             if body:
                 return f"{header}\n\n{body}\n{bar}"
             return f"{header}\n{bar}"
@@ -3996,111 +5551,141 @@ async def call_tool(name: str, arguments: dict):
         if result.get('multi') and isinstance(result.get('results'), list):
             blocks = []
             for sub in result['results']:
-                decoded = sub.get('decoded') if isinstance(sub, dict) else None
-                path_str = sub.get('path', '') if isinstance(sub, dict) else ''
+                if not isinstance(sub, dict):
+                    blocks.append(TextContent(type="text", text=str(sub)))
+                    continue
+                decoded = sub.get('decoded')
+                path_str = sub.get('path', '')
                 if isinstance(decoded, str):
                     blocks.append(TextContent(type="text", text=_frame(decoded, path_str)))
                 else:
-                    blocks.append(TextContent(type="text", text=json.dumps(sub, indent=2)))
+                    summary = {"path": path_str, "size": sub.get("size", "?")}
+                    if sub.get("hex"): summary["hex"] = sub["hex"]
+                    if sub.get("hex_note"): summary["hex_note"] = sub["hex_note"]
+                    if sub.get("error"): summary["error"] = sub["error"]
+                    blocks.append(TextContent(type="text", text=json.dumps(summary, indent=2)))
             return blocks
         # Single file
         decoded = result.get('decoded')
         if isinstance(decoded, str):
             return [TextContent(type="text", text=_frame(decoded, result.get('path', '')))]
 
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+    # Format result as readable text instead of raw JSON
+    if isinstance(result, dict):
+        if result.get('_card'):
+            return [TextContent(type="text", text=result['text'])]
+        if 'error' in result:
+            text = f"Error: {result['error']}"
+        else:
+            lines = []
+            for k, v in result.items():
+                if isinstance(v, dict):
+                    lines.append(f"{k}:")
+                    for kk, vv in v.items():
+                        lines.append(f"  {kk}: {vv}")
+                elif isinstance(v, list) and v and isinstance(v[0], dict):
+                    lines.append(f"{k}:")
+                    for item in v[:50]:
+                        lines.append("  " + "  ".join(f"{kk}: {vv}" for kk, vv in item.items()))
+                else:
+                    lines.append(f"{k}: {v}")
+            text = "\n".join(lines)
+    elif isinstance(result, str):
+        text = result
+    else:
+        text = str(result)
+    return [TextContent(type="text", text=text)]
 
 
 @server.list_tools()
 async def list_tools():
     return [
-        Tool(name="spotlight", description="Open a ROM file (.nds, .gba, .gbc, .gb) for exploration", inputSchema={
+        Tool(name="spotlight", description="Open a ROM file for exploration. Second call on the same game restores from ICR cache instantly (no rescan). Returns NARC paths for key roles (trdata, trpoke, personal, learnsets).", inputSchema={
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "Path to ROM file"}},
+            "properties": {"path": {"type": "string", "description": "Absolute path to .nds, .gba, .gbc, or .gb file"}},
             "required": ["path"]
         }),
-        Tool(name="return", description="Close the current ROM", inputSchema={
+        Tool(name="return", description="Close the current ROM. If multiple ROMs are open, switches to the next one. Use save=True only when you have sketched changes you want to keep.", inputSchema={
             "type": "object",
-            "properties": {"save": {"type": "boolean", "description": "Save changes before closing"}}
+            "properties": {"save": {"type": "boolean", "description": "Repack and save before closing (default: false). Only needed after sketch calls."}}
         }),
-        Tool(name="summarize", description="List contents at a path within the ROM. Pass a NARC file path to see its contents.", inputSchema={
+        Tool(name="summarize", description="List filesystem contents or NARC file indices. Use to explore unknown paths. Skip if the path is already known from spotlight output or ICR.", inputSchema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Path to list (default: root). Can be a folder or NARC file path."},
-                "expand_narcs": {"type": "boolean", "description": "If true, show preview of NARC contents inline (default: false)"}
+                "path": {"type": "string", "description": "Folder path (default: root) or NARC file path to list its internal files"},
+                "expand_narcs": {"type": "boolean", "description": "Show NARC file count inline (default: false)"}
             }
         }),
-        Tool(name="decipher", description="Read and decode files. Auto-decodes known structures. reads= for structured binary (u8/u16/u32/ptr32/text) with XOR/pointer support.", inputSchema={
+        Tool(name="decipher", description="Read and decode a file. Known flipnote notes surface automatically at the top of output — read them before interpreting. Auto-decodes: trainers (trdata+trpoke combined), personal stats, learnsets, evolutions, move data, encounters (with location name), items, Pokeathlon, contest, PWT/subway/tower pools. Returns decoded text when recognized, hex summary otherwise. Path syntax: arm9.bin, narc/path:index, overlay0.bin. Comma-separate for multi-file.", inputSchema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path. arm9.bin/arm7.bin for ARM. narc:index for NARC. Comma-separated for multi."},
+                "path": {"type": "string", "description": "File path. NARC files: 'a/0/9/1:156'. ARM: 'arm9.bin'. Cross-ROM: 'IRE:a/0/9/1:156'. Comma-separated for batch."},
                 "offset": {"type": "integer", "description": "Byte offset (default: 0)"},
                 "length": {"type": "integer", "description": "Bytes to read (default: all)"},
-                "decompress": {"type": "boolean", "description": "Auto-decompress (default: true)"},
-                "reads": {"type": "string", "description": "Structured: u8/u16/u32/s8/s16/s32/ptr32/text"},
-                "count": {"type": "integer", "description": "Values to read (default: 1)"},
-                "xor": {"type": "string", "description": "XOR key hex (e.g. AB CD)"},
-                "endian": {"type": "string", "enum": ["little","big"], "description": "Byte order"},
-                "stride": {"type": "integer", "description": "Bytes between reads (0=packed)"},
-                "base": {"type": "integer", "description": "Base addr for ptr32"}
+                "decompress": {"type": "boolean", "description": "Auto-decompress LZ10/LZ11 (default: true)"}
             },
             "required": ["path"]
         }),
-        Tool(name="sketch", description="Write data to a file (supports text and hex with spaces)", inputSchema={
+        Tool(name="sketch", description="Write bytes to a file. Writes in-place to the loaded ROM (not disk) — call record to persist. NARC append: use ':append' as index (e.g. 'a/2/6/7:append'). PNG sprite import: encoding='png', data=base64 or file path — auto-converts to NCGR/NCLR/NSCR triplet and appends to NARC.", inputSchema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path"},
-                "data": {"type": "string", "description": "Data to write (hex can have spaces: 'F8 B5 82 B0')"},
-                "offset": {"type": "integer", "description": "Byte offset (default: 0)"},
-                "encoding": {"type": "string", "enum": ["hex", "utf8", "utf16le", "ascii"], "description": "Data encoding (default: hex)"}
+                "path": {"type": "string", "description": "File path. Use ':append' to add new file to NARC (e.g. a/2/6/7:append)"},
+                "data": {"type": "string", "description": "Data to write. Hex by default. For png encoding: base64 string or file path on disk."},
+                "offset": {"type": "integer", "description": "Byte offset to write at (default: 0)"},
+                "encoding": {"type": "string", "enum": ["hex", "utf8", "utf16le", "ascii", "png"], "description": "Encoding. 'png' converts image to NDS tile format (NCGR/NCLR/NSCR)."}
             },
             "required": ["path", "data"]
         }),
-        Tool(name="record", description="Repack and save the ROM", inputSchema={
+        Tool(name="record", description="Repack and save the ROM to disk. Recompresses ARM9 and writes all modified NARCs and overlays. Only needed after sketch calls. Can write to the original path or a new file.", inputSchema={
             "type": "object",
-            "properties": {"output_path": {"type": "string", "description": "Output path"}},
+            "properties": {"output_path": {"type": "string", "description": "Output file path (can be same as input to overwrite)"}},
             "required": ["output_path"]
         }),
-        Tool(name="scope", description="Raw hex dump with optional search and XOR", inputSchema={
+        Tool(name="scope", description="Raw hex dump. Auto-disassembles ARM9, ARM7, and overlay paths (ARM/Thumb). Flipnote notes surface automatically. Use when decipher doesn't auto-decode and you need to inspect raw bytes, search for a byte pattern, or apply an XOR mask. For structured reads use probe instead.", inputSchema={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path (optional)"},
-                "offset": {"type": "integer", "description": "Start offset"},
-                "length": {"type": "integer", "description": "Bytes to dump"},
-                "search": {"type": "string", "description": "Hex pattern to search"},
-                "xor": {"type": "string", "description": "Hex XOR key (e.g. 'AB' or 'AB CD EF')"}
+                "path": {"type": "string", "description": "File path (same syntax as decipher)"},
+                "offset": {"type": "integer", "description": "Start offset (default: 0)"},
+                "length": {"type": "integer", "description": "Bytes to dump (default: 256)"},
+                "search": {"type": "string", "description": "Hex pattern to find — returns all offsets"},
+                "xor": {"type": "string", "description": "XOR key applied before display (e.g. 'AB' or 'AB CD EF')"}
             }
         }),
-        Tool(name="dowse", description="Search NARC files by hex pattern, or look up text table entries by name", inputSchema={
+        Tool(name="dowse", description="Three modes: (1) name lookup — find species/move/item/trainer/location in text tables, returns file indices; if no text hit, falls back to NARC role/category search (e.g. name='encounters' or name='trdata'). (2) name+narc_path — find NARCs containing that entity as a u16 reference. (3) hex+narc_path — find files in a NARC containing a byte pattern.", inputSchema={
             "type": "object",
             "properties": {
-                "narc_path": {"type": "string", "description": "NARC path to search (for hex mode)"},
-                "hex": {"type": "string", "description": "Hex pattern to find in NARC files"},
-                "name": {"type": "string", "description": "Name to look up in text tables (e.g. Raichu)"},
-                "table": {"type": "string", "description": "Specific table to search (species, moves, items, abilities, trainer_names, trainer_classes)"},
-                "exact": {"type": "boolean", "description": "Match whole string instead of substring (default: false)"}
+                "name": {"type": "string", "description": "Entity or category to search. Searches all text tables; falls back to NARC role names if no match."},
+                "table": {"type": "string", "description": "Restrict to one table: species, moves, items, abilities, trainer_names, trainer_classes"},
+                "exact": {"type": "boolean", "description": "Exact match instead of substring (default: false)"},
+                "narc_path": {"type": "string", "description": "With name: find NARCs referencing this entity. With hex: search this NARC for a byte pattern."},
+                "hex": {"type": "string", "description": "Hex pattern to find in NARC files (requires narc_path)"},
+                "difficulty": {"type": "string", "description": "Filter trainer results by difficulty mode: normal, challenge, easy (BW2 only — Challenge Mode has separate trainer files)"}
             }
         }),
-        Tool(name="judgement", description="Compare two files", inputSchema={
+        Tool(name="judgement", description="Byte-level diff of two files. Supports cross-ROM comparison using game code prefix: 'IRE:a/0/1/6:1' vs 'IPK:a/0/0/2:1'. Same path syntax as decipher.", inputSchema={
             "type": "object",
             "properties": {
-                "path_a": {"type": "string", "description": "First file"},
-                "path_b": {"type": "string", "description": "Second file"}
+                "path_a": {"type": "string", "description": "First file path (cross-ROM prefix supported: 'IRE:a/0/9/1:38')"},
+                "path_b": {"type": "string", "description": "Second file path"}
             },
             "required": ["path_a", "path_b"]
         }),
-        Tool(name="stats", description="Show honest documentation coverage statistics", inputSchema={
+        Tool(name="stats", description="Show ICR index coverage: how many NARCs and files have been indexed, which roles are decoded, and how many manual flipnote notes exist. Use to assess what the server knows about the current ROM.", inputSchema={
             "type": "object", "properties": {}
         }),
-        Tool(name="list_flipnotes", description="List all known game Flipnotes", inputSchema={
+        Tool(name="list_flipnotes", description="List all flipnotes (one per game pair). Flipnotes store manual notes that persist across all restarts. Use view_flipnote to read a specific one.", inputSchema={
             "type": "object", "properties": {}
         }),
-        Tool(name="view_flipnote", description="View a Flipnote's contents", inputSchema={
+        Tool(name="view_flipnote", description="Read the flipnote for a game. summary=True returns paths only (cheaper). search= filters notes by path or description.", inputSchema={
             "type": "object",
-            "properties": {"game": {"type": "string", "description": "Game code or title"}},
+            "properties": {
+                "game": {"type": "string", "description": "Game code (e.g. IRE) or partial title (e.g. Black 2)"},
+                "search": {"type": "string", "description": "Filter notes by path or description keyword"},
+                "summary": {"type": "boolean", "description": "Return paths only, no descriptions (default: false)"}
+            },
             "required": ["game"]
         }),
-        Tool(name="note", description="Add a note to a Flipnote (current ROM or specify game code)", inputSchema={
+        Tool(name="note", description="Permanently record a discovery. Notes survive all restarts. Use immediately after finding something — NARC role, format, offset, bracket mapping, anything. Prefer batch_notes for 3+ notes.", inputSchema={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path being documented"},
@@ -4115,7 +5700,7 @@ async def list_tools():
             },
             "required": ["path", "description"]
         }),
-        Tool(name="batch_notes", description="Write multiple notes at once. Single disk write.", inputSchema={
+        Tool(name="batch_notes", description="Write multiple notes in one disk write. Use instead of repeated note calls when documenting multiple paths at once.", inputSchema={
             "type": "object",
             "properties": {
                 "notes": {"type": "array", "items": {"type": "object", "properties": {
@@ -4138,13 +5723,31 @@ async def list_tools():
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"},
                 "file_range": {"type": "string", "description": "File range description"},
                 "examples": {"type": "array", "items": {"type": "string"}, "description": "Examples"},
-                "related": {"type": "array", "items": {"type": "string"}, "description": "Related paths"}
+                "related": {"type": "array", "items": {"type": "string"}, "description": "Related paths"},
+                "game": {"type": "string", "description": "Game code (defaults to current ROM)"}
+            },
+            "required": ["path"]
+        }),
+        Tool(name="probe", description="Structured binary read. Known flipnote notes for the path surface automatically — read them before interpreting raw values. Primary for ARM9, overlay, unknown binary. Types: u8/u16/u32/s8/s16/s32/ptr32/text. Auto-annotates values with species/move/item names when they match.", inputSchema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path (arm9.bin, narc:index, overlay#.bin, or ROM file path)"},
+                "offset": {"type": "integer", "description": "Byte offset to start reading (default: 0)"},
+                "reads": {"type": "string", "description": "Type to read: u8/u16/u32/s8/s16/s32/ptr32/text (default: u16)"},
+                "count": {"type": "integer", "description": "Number of values to read (default: 1)"},
+                "xor": {"type": "string", "description": "XOR key hex (e.g. AB CD)"},
+                "endian": {"type": "string", "enum": ["little", "big"], "description": "Byte order (default: little)"},
+                "stride": {"type": "integer", "description": "Bytes between reads, 0=packed (default: 0)"},
+                "base": {"type": "integer", "description": "Base address for ptr32 pointer arithmetic"}
             },
             "required": ["path"]
         }),
         Tool(name="delete_note", description="Delete a note", inputSchema={
             "type": "object",
-            "properties": {"path": {"type": "string", "description": "Path of note to delete"}},
+            "properties": {
+                "path": {"type": "string", "description": "Path of note to delete"},
+                "game": {"type": "string", "description": "Game code (defaults to current ROM)"}
+            },
             "required": ["path"]
         })
     ]
