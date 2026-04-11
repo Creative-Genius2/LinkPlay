@@ -22,11 +22,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Add parent directory so eonet_driver.py is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Ensure eonet_driver._srv() finds this module even when running as __main__
+sys.modules["server"] = sys.modules[__name__]
+
 # Import setup_tools but call inside main() after stdio is captured
 from setup_tools import setup_tools, get_tool_path
 
 # Eonet ICR engine — auto-discovery, flipnote labeling, query resolution
-from eonet_driver import _build_eonet, eonet_resolve
+from eonet_driver import _build_eonet, eonet_resolve, _auto_enc_loc, resolve_chain
 
 # Required: ndspy for DS ROM handling
 import ndspy.rom
@@ -48,6 +51,7 @@ server = Server("linkplay")
 
 # State
 current_rom = None
+_user_active_gc = None   # Game code of the ROM the user most recently spotlighted (not changed by BFS)
 current_flipnote = None
 text_tables = {}  # Populated on open_rom: {file_index: [strings], 'species': [strings], ...}
 text_narc = None   # Kept in memory for lazy lookups
@@ -57,17 +61,34 @@ narc_roles = {}    # Reverse map: narc_path -> role (e.g. 'a/0/9/2' -> 'trpoke')
 tm_table = []      # Indexed by bit position: [(label, move_id), ...] — populated at ROM open
 loaded_roms = {}   # game_code -> saved state for multi-ROM support
 _narc_cache = {}   # (game_code, narc_path) -> parsed ndspy.narc.NARC
-_rom_restore_done = False  # Flipped once after first tool call triggers restore
+_rom_restore_in_progress = False  # Guards against concurrent restore runs
+_rom_restore_done = False         # Set True after first restore attempt completes
+_restore_task = None               # Background task handle for ROM restore
+_startup_log = []                  # Collects restore/BFS messages for the model to see
 eonet_labels = {}  # game_code -> {narc_path: {'role': str, 'labels': {idx: 'Name (Role)'}}}
 eonet_index = {}   # game_code -> [{name_lower: str, path: str, role: str, idx: int}, ...]
 
 
+def _rom_is_fully_loaded(gc: str) -> bool:
+    """True if this game code has a live ndspy ROM object (not just registry metadata)."""
+    # Check the active ROM first (not yet saved to loaded_roms)
+    if current_rom and current_rom.get('header', {}).get('game_code') == gc:
+        return current_rom.get('rom') is not None
+    if gc not in loaded_roms:
+        return False
+    state = loaded_roms[gc]
+    rom_obj = state.get('current_rom') if isinstance(state, dict) else None
+    if rom_obj is None:
+        return False
+    return rom_obj.get('rom') is not None
+
+
 async def _do_pending_restore():
-    """Load any ROMs from last_rom.json that aren't already in loaded_roms. Runs once."""
-    global _rom_restore_done
-    if _rom_restore_done:
+    """Load any ROMs from last_rom.json that aren't fully loaded yet. Safe to call multiple times."""
+    global _rom_restore_in_progress, _rom_restore_done
+    if _rom_restore_done or _rom_restore_in_progress:
         return
-    _rom_restore_done = True
+    _rom_restore_in_progress = True
     try:
         reg_path = Path.home() / ".linkplay" / "last_rom.json"
         if not reg_path.exists():
@@ -75,19 +96,58 @@ async def _do_pending_restore():
         registry = json.loads(reg_path.read_text(encoding='utf-8'))
         if 'game_code' in registry:
             registry = {registry['game_code']: registry['path']}
-        for gc, rom_path in registry.items():
-            if gc in loaded_roms:
-                continue
+
+        async def _restore_one(gc, rom_path):
+            if _rom_is_fully_loaded(gc):
+                return
             if not rom_path or not Path(rom_path).exists():
                 print(f"[linkplay] Registry ROM not found, skipping: {gc} → {rom_path}", file=sys.stderr, flush=True)
-                continue
+                return
             try:
                 await spotlight(rom_path)
                 print(f"[linkplay] Auto-restored ROM: {gc}", file=sys.stderr, flush=True)
+                _startup_log.append(f"Restored: {gc}")
             except Exception as e:
                 print(f"[linkplay] Failed to restore {gc}: {e}", file=sys.stderr, flush=True)
+                _startup_log.append(f"FAILED to restore {gc}: {e}")
+
+        restored = []
+        for gc, path in registry.items():
+            if not _rom_is_fully_loaded(gc):
+                await _restore_one(gc, path)
+                restored.append(gc)
+
+        # Run BFS/ICR for each restored ROM in sequence — never concurrent
+        import asyncio as _asyncio
+        for gc in restored:
+            try:
+                _save_active_state()
+                if gc in loaded_roms:
+                    _restore_state(gc)
+                loop = _asyncio.get_running_loop()
+                await loop.run_in_executor(None, lambda g=gc: _build_eonet(g))
+                _save_active_state()
+                _startup_log.append(f"BFS complete for {gc}")
+            except Exception as e:
+                import traceback
+                err_msg = f"[linkplay] BFS failed for {gc}: {e}\n{traceback.format_exc()}"
+                print(err_msg, file=sys.stderr, flush=True)
+                try:
+                    with open(str(Path.home() / ".linkplay" / "bfs_error.log"), "a") as _ef:
+                        _ef.write(err_msg + "\n")
+                except: pass
+                _startup_log.append(f"BFS FAILED for {gc}: {e}")
     except Exception as e:
-        print(f"[linkplay] Registry restore error: {e}", file=sys.stderr, flush=True)
+        import traceback
+        err_msg = f"[linkplay] Registry restore error: {e}\n{traceback.format_exc()}"
+        print(err_msg, file=sys.stderr, flush=True)
+        try:
+            with open(str(Path.home() / ".linkplay" / "bfs_error.log"), "a") as _ef:
+                _ef.write(err_msg + "\n")
+        except: pass
+    finally:
+        _rom_restore_in_progress = False
+        _rom_restore_done = True
 
 
 def _get_narc(narc_path: str):
@@ -107,11 +167,14 @@ def _invalidate_narc(narc_path: str):
 
 
 def _parse_rom_prefix(path: str):
-    """Parse optional game-code prefix from path. 'IRE:a/0/1/6:1' -> ('IRE', 'a/0/1/6:1')."""
-    if len(path) > 4 and path[3] == ':' and path[:3].isalpha() and path[:3].isupper():
-        gc = path[:3]
-        if gc in loaded_roms or (current_rom and current_rom['header']['game_code'] == gc):
-            return gc, path[4:]
+    """Parse optional game-code prefix from path. 'IRE:a/0/1/6:1' -> ('IRE', 'a/0/1/6:1').
+    Handles both 3-char (NDS) and 4-char (GBA) game codes."""
+    for code_len in (4, 3):
+        if len(path) > code_len and path[code_len] == ':':
+            candidate = path[:code_len]
+            if candidate.isalpha() and candidate.isupper():
+                if candidate in loaded_roms or (current_rom and current_rom['header']['game_code'] == candidate):
+                    return candidate, path[code_len + 1:]
     return None, path
 
 
@@ -494,7 +557,9 @@ def read_gba_header(path: str) -> dict:
         title = f.read(12).decode('ascii', errors='ignore').strip('\x00')
         full_code = f.read(4).decode('ascii', errors='ignore')
 
-    game_code = full_code[:3] if len(full_code) >= 3 else full_code
+    # GBA uses the full 4-char code as game_code (BPRE, AXVE, BPEE, etc.)
+    # unlike NDS which strips the region char
+    game_code = full_code.strip() if full_code.strip() else full_code[:3]
     region_char = full_code[3] if len(full_code) >= 4 else 'E'
     region = REGION_MAP.get(region_char, 'US')
 
@@ -503,34 +568,66 @@ def read_gba_header(path: str) -> dict:
         'full_code': full_code,
         'region_char': region_char,
         'game_title': title,
-        'region': region
+        'region': region,
+        'is_english': region_char in ('E', 'P', 'D', 'F', 'S', 'I'),
     }
 
 
 def read_gb_header(path: str) -> dict:
     """Read GB/GBC ROM header."""
     with open(path, 'rb') as f:
-        f.seek(0x134)
-        title = f.read(16).decode('ascii', errors='ignore').strip('\x00')
+        data = f.read(0x150)
 
-    game_code = title[:3] if len(title) >= 3 else title
-    
+    title = data[0x134:0x144].decode('ascii', errors='ignore').strip('\x00').strip()
+    region_byte = data[0x14A] if len(data) > 0x14A else 0x01
+    region = 'JP' if region_byte == 0x00 else 'US'
+    region_char = 'J' if region == 'JP' else 'E'
+    is_english = region != 'JP'
+
+    # Use full title as game code (GB has no 4-char code like GBA/NDS)
+    # Normalize: "POKEMON RED" -> "PMR", "POKEMON BLUE" -> "PMB" etc.
+    _GB_GAME_CODES = {
+        'POKEMON RED':    'PMR', 'POKEMON BLUE':   'PMB',
+        'POKEMON YELLOW': 'PMY', 'POKEMON GREEN':  'PMG',
+        'POKEMON_GLDAAUE':'PMG2','POKEMON GOLD':   'PMG2',
+        'PM_CRYSTAL':     'PMC', 'POKEMON CRYSTAL':'PMC',
+        'POKEMON SILVER': 'PMS',
+    }
+    game_code = _GB_GAME_CODES.get(title.upper(), title[:3].upper())
+
     return {
         'game_code': game_code,
         'full_code': title[:4] if len(title) >= 4 else title,
-        'region_char': 'E',
+        'region_char': region_char,
         'game_title': title,
-        'region': 'US'
+        'region': region,
+        'is_english': is_english,
     }
 
 
 # Shared flipnotes — paired games share one flipnote
 FLIPNOTE_PAIRS = {
+    # Gen V
+    'Pokémon Black & White': ['IRB', 'IRA'],
+    'Pokémon Black & White 2': ['IRE', 'IRD'],
+    # Gen IV
     'Pokémon Diamond & Pearl': ['ADA', 'APA'],
     'Pokémon Platinum': ['CPU'],
     'Pokémon HeartGold & SoulSilver': ['IPK', 'IPG'],
-    'Pokémon Black & White': ['IRB', 'IRA'],
-    'Pokémon Black & White 2': ['IRE', 'IRD'],
+    # Gen III (GBA)
+    'Pokémon FireRed & LeafGreen': ['BPRE', 'BPGE'],
+    'Pokémon Ruby & Sapphire': ['AXVE', 'AXPE'],
+    'Pokémon Emerald': ['BPEE'],
+    # Gen II (GBC)
+    'Pokémon Gold & Silver': ['PMG2', 'PMS'],
+    'Pokémon Crystal': ['PM_'],
+    # Gen I (GB) — US
+    'Pokémon Red & Blue': ['PMR', 'PMB'],
+    'Pokémon Yellow': ['PMY'],
+    # Gen I (GB) — JP
+    'Pocket Monsters Red & Green': ['PKMRJ', 'PMG'],
+    'Pocket Monsters Blue (JP)': ['PMBJP'],
+    'Pocket Monsters Yellow (JP)': ['PMYJ'],
 }
 
 def get_shared_name(game_code: str) -> Optional[str]:
@@ -859,6 +956,353 @@ def compress_data(data: bytes, compression: str) -> bytes:
     return data
 
 
+# ============ Gen III/II/I Text Decoders ============
+
+# Gen III (GBA) character map — English FireRed/Ruby/Emerald
+# Empirically verified from FireRed (USA): A=0xBB, confirmed via BULBASAUR at 0x245EEB.
+# Bulbapedia listed A=0xC1 but that was wrong for this ROM version.
+# EOS=0xFF. 0x00 is null padding between fixed-width entries (NOT space).
+# Space within strings (e.g. "MASTER BALL") is 0x00 contextually — we skip leading 0x00s.
+_GEN3_CHARMAP_EN: dict = {}
+for _i, _c in enumerate('ABCDEFGHIJKLMNOPQRSTUVWXYZ'):
+    _GEN3_CHARMAP_EN[0xBB + _i] = _c
+for _i, _c in enumerate('abcdefghijklmnopqrstuvwxyz'):
+    _GEN3_CHARMAP_EN[0xD5 + _i] = _c
+for _i, _c in enumerate('0123456789'):
+    _GEN3_CHARMAP_EN[0xA1 + _i] = _c
+_GEN3_CHARMAP_EN.update({
+    0x00: ' ',   # space within strings; skip leading 0x00 (entry padding) in scanner
+    0x1B: 'é',   # POKé BALL etc.
+    0xAB: '!', 0xAC: '?', 0xAD: '.', 0xAE: '-', 0xB8: ',',
+    0xB2: "'", 0xB5: '♀', 0xB6: '♂',
+    0x53: '', 0x54: '',  # control-code prefixes in some class names (silently skipped)
+})
+
+# Gen I (GB) character map — English Red/Blue/Yellow
+# Space=0x7F, EOS=0x50, A-Z=0x80-0x99, a-z=0xA0-0xB9, 0-9=0xF6-0xFF
+_GEN1_CHARMAP_EN: dict = {0x7F: ' '}
+for _i, _c in enumerate('ABCDEFGHIJKLMNOPQRSTUVWXYZ'):
+    _GEN1_CHARMAP_EN[0x80 + _i] = _c
+for _i, _c in enumerate('abcdefghijklmnopqrstuvwxyz'):
+    _GEN1_CHARMAP_EN[0xA0 + _i] = _c
+for _i, _c in enumerate('0123456789'):
+    _GEN1_CHARMAP_EN[0xF6 + _i] = _c
+_GEN1_CHARMAP_EN.update({0xE8: 'd', 0xE9: 'l', 0xEA: 's', 0xEB: 't', 0xEC: 'v'})
+
+# Gen II (GBC) shares Gen I encoding for English
+_GEN2_CHARMAP_EN = dict(_GEN1_CHARMAP_EN)
+
+# EOS bytes per platform
+_GEN3_EOS = 0xFF
+_GEN1_EOS = 0x50
+_GEN2_EOS = 0x50
+
+
+def scan_rom_text(rom_data: bytes, charmap: dict, eos: int,
+                  min_strlen: int = 3, min_table: int = 8,
+                  max_strlen: int = 20) -> list:
+    """Scan a raw ROM binary for text tables.
+
+    Looks for runs of back-to-back valid strings (terminated by eos byte).
+    Returns list of lists — each inner list is a candidate text table (list of strings).
+
+    Strategy: slide over the ROM at every offset. If we hit a valid string
+    followed by EOS, keep going. When the run breaks, if we collected enough
+    strings, save it as a candidate table.
+    """
+    tables = []
+    current_table = []
+    i = 0
+    data_len = min(len(rom_data), 8 * 1024 * 1024)  # text lives in first 8MB
+
+    while i < data_len:
+        # Skip leading 0x00 bytes — these are null padding between fixed-width
+        # table entries, not spaces at the start of a string.
+        while i < data_len and rom_data[i] == 0x00:
+            i += 1
+
+        # Try to decode a string starting at i
+        j = i
+        chars = []
+        while j < data_len and j < i + max_strlen:
+            b = rom_data[j]
+            if b == eos:
+                break
+            ch = charmap.get(b)
+            if ch is None:
+                break
+            chars.append(ch)
+            j += 1
+
+        # Strip trailing spaces (from in-string 0x00s near end of entry)
+        name = ''.join(chars).rstrip()
+
+        if j < data_len and rom_data[j] == eos and len(name) >= min_strlen:
+            # Valid string found
+            current_table.append(name)
+            i = j + 1  # advance past EOS
+        else:
+            # Not a valid string here
+            if len(current_table) >= min_table:
+                tables.append(current_table)
+            current_table = []
+            i += 1
+
+    if len(current_table) >= min_table:
+        tables.append(current_table)
+
+    return tables
+
+
+def _scan_gen3_abilities(rom_data: bytes, charmap: dict, eos: int):
+    """Scan Gen III ability names starting from STENCH.
+
+    Ability names are all-uppercase and short (≤12 chars).
+    Descriptions are mixed-case and longer — we stop when we hit those.
+    Prepends a blank entry at index 0 (ability 0 = no ability).
+    Populates an integer-keyed entry in text_tables.
+    """
+    global text_tables
+    if 'abilities' in text_tables:
+        return  # already found by fingerprinting
+
+    reverse = {v: k for k, v in charmap.items() if isinstance(v, str) and len(v) == 1}
+    try:
+        stench_bytes = bytes([reverse[c] for c in 'STENCH']) + bytes([eos])
+    except KeyError:
+        return
+
+    idx = rom_data.find(stench_bytes)
+    if idx < 0:
+        return
+
+    abilities = ['']  # index 0 = no ability (blank)
+    i = idx
+    while i < len(rom_data):
+        while i < len(rom_data) and rom_data[i] == 0x00:
+            i += 1
+        j = i
+        chars = []
+        while j < len(rom_data) and rom_data[j] != eos and j < i + 15:
+            ch = charmap.get(rom_data[j])
+            if ch is None:
+                break
+            chars.append(ch)
+            j += 1
+        name = ''.join(chars).rstrip()
+        if rom_data[j] == eos and 2 <= len(name) <= 13:
+            # Accept only if looks like an ability name (no lowercase, not a sentence)
+            if name == name.upper():
+                abilities.append(name)
+                i = j + 1
+                continue
+        break  # hit descriptions or end
+
+    if len(abilities) > 5:
+        next_key = max((k for k in text_tables if isinstance(k, int)), default=-1) + 1
+        text_tables[next_key] = abilities
+
+
+def _scan_gen3_species(rom_data: bytes, charmap: dict, eos: int):
+    """Scan Gen III species names starting from BULBASAUR.
+
+    Species are fixed-width name slots. Find BULBASAUR, verify IVYSAUR follows
+    at the right distance (to get slot size), then read forward.
+    Prepends a dummy at index 0. Sets text_tables['species'] directly.
+    """
+    global text_tables
+    if 'species' in text_tables:
+        return
+
+    reverse = {v: k for k, v in charmap.items() if isinstance(v, str) and len(v) == 1}
+    try:
+        bulb = bytes([reverse[c] for c in 'BULBASAUR']) + bytes([eos])
+        ivy  = bytes([reverse[c] for c in 'IVYSAUR'])
+    except KeyError:
+        return
+
+    # Find BULBASAUR followed by IVYSAUR at the right slot distance
+    search = 0
+    while True:
+        pos = rom_data.find(bulb, search)
+        if pos < 0:
+            return
+        # Slot size = distance from BULBASAUR start to next non-padding byte
+        nxt = pos + len(bulb)
+        while nxt < len(rom_data) and rom_data[nxt] in (0x00, eos):
+            nxt += 1
+        slot = nxt - pos
+        if 2 <= slot <= 20 and rom_data[nxt: nxt + len(ivy)] == ivy:
+            break
+        search = pos + 1
+
+    # Read backwards one slot for dummy (index 0 = Missingno)
+    start = max(0, pos - slot)
+    names = []
+    i = start
+    while i < len(rom_data) and len(names) < 500:
+        j, chars = i, []
+        while j < i + slot and j < len(rom_data) and rom_data[j] != eos:
+            ch = charmap.get(rom_data[j])
+            if ch is None:
+                break
+            chars.append(ch)
+            j += 1
+        name = ''.join(chars).rstrip()
+        if len(names) > 10 and not name:
+            break
+        names.append(name)
+        i += slot
+
+    if len(names) > 10:
+        text_tables['species'] = names
+
+
+
+
+def _scan_gen3_trainer_names(rom_data: bytes, charmap: dict, eos: int):
+    """Scan Gen III ROM for trainer structs and extract names into text_tables['trainer_names'].
+
+    Trainer struct (40 bytes): flags(1), class(1), music(1), sprite(1), name(12), ...
+    party_count(u32 at +32), party_ptr(u32 at +36).
+    Validates each candidate by checking flags 0-3, class 1-199, count 1-6, valid GBA ptr.
+    """
+    global text_tables
+    if 'trainer_names' in text_tables:
+        return
+
+    import struct as _struct
+    names_by_offset = {}
+    for i in range(0, len(rom_data) - 40, 4):
+        if rom_data[i] > 3 or rom_data[i + 1] == 0 or rom_data[i + 1] >= 200:
+            continue
+        count = _struct.unpack_from('<I', rom_data, i + 32)[0]
+        if not (1 <= count <= 6):
+            continue
+        ptr = _struct.unpack_from('<I', rom_data, i + 36)[0]
+        if not (0x08000000 <= ptr <= 0x0AFFFFFF):
+            continue
+        j, chars = i + 4, []
+        while j < i + 16 and rom_data[j] != eos:
+            ch = charmap.get(rom_data[j])
+            if ch is None:
+                break
+            chars.append(ch)
+            j += 1
+        name = ''.join(chars).strip()
+        if len(name) >= 2 and name == name.upper():
+            names_by_offset[i] = name
+
+    if len(names_by_offset) > 10:
+        text_tables['trainer_names'] = [n for _, n in sorted(names_by_offset.items())]
+
+
+def _scan_gen3_items(rom_data: bytes, charmap: dict, eos: int):
+    """Scan Gen III item table (44-byte structs, name in first 14 bytes).
+
+    Finds MASTER BALL to anchor the table, then reads fixed-stride entries.
+    Populates text_tables['items'] directly.
+    """
+    global text_tables
+    reverse = {v: k for k, v in charmap.items() if isinstance(v, str) and len(v) == 1}
+    try:
+        mb_bytes = bytes([reverse[c] for c in 'MASTER BALL']) + bytes([eos])
+    except KeyError:
+        return
+
+    idx = rom_data.find(mb_bytes)
+    if idx < 0:
+        return
+
+    ITEM_STRUCT = 44
+    NAME_LEN = 14
+    items = []
+    offset = idx
+    while offset + ITEM_STRUCT <= len(rom_data):
+        name_bytes = rom_data[offset:offset + NAME_LEN]
+        name = ''
+        for b in name_bytes:
+            if b == eos:
+                break
+            ch = charmap.get(b)
+            if ch is None:
+                break
+            name += ch
+        name = name.strip()
+        if not name:
+            break
+        items.append(name)
+        offset += ITEM_STRUCT
+
+    if items:
+        # Add as integer key so auto_detect_tables can fingerprint it
+        next_key = max((k for k in text_tables if isinstance(k, int)), default=-1) + 1
+        text_tables[next_key] = items
+
+
+def bootstrap_text_tables_binary(rom_data: bytes, rom_type: str,
+                                 region: str = 'US') -> dict:
+    """Bootstrap text tables from a raw GBA/GB/GBC ROM binary.
+
+    Scans the binary for text tables, then fingerprints to identify
+    species, moves, items, etc. Same fingerprint logic as NDS games —
+    the indices are universal across all generations.
+    """
+    global text_tables, text_gen
+
+    if rom_type == 'gba':
+        charmap = _GEN3_CHARMAP_EN
+        eos = _GEN3_EOS
+        gen = 3
+    elif rom_type in ('gbc', 'gb'):
+        charmap = _GEN1_CHARMAP_EN  # Gen I/II share English map
+        eos = _GEN1_EOS
+        gen = 2 if rom_type == 'gbc' else 1
+    else:
+        return {"error": f"Unsupported ROM type: {rom_type}"}
+
+    text_tables = {}
+    text_gen = gen
+
+    # Scan for text tables (species, moves, abilities, natures — pure string arrays)
+    candidates = scan_rom_text(rom_data, charmap, eos)
+
+    if not candidates:
+        return {"error": "No text tables found in ROM binary", "gen": gen}
+
+    # Load candidates into text_tables as integer-indexed "files"
+    for idx, table in enumerate(candidates):
+        text_tables[idx] = table
+
+    # Gen III: items are 44-byte structs, abilities may be merged with descriptions.
+    # Use dedicated scanners anchored to known strings.
+    if gen == 3:
+        _scan_gen3_abilities(rom_data, charmap, eos)
+        _scan_gen3_items(rom_data, charmap, eos)
+        _scan_gen3_species(rom_data, charmap, eos)
+        _scan_gen3_trainer_names(rom_data, charmap, eos)
+
+    # Auto-detect named tables via fingerprinting (same as NDS path)
+    found = auto_detect_tables()
+
+    result = {"gen": gen, "rom_type": rom_type,
+              "candidates": len(candidates),
+              "file_count": len(candidates)}
+
+    if found:
+        result["status"] = "ok"
+        result["detected"] = {k: f"table:{v} ({len(text_tables.get(k, []))} entries)"
+                              for k, v in found.items()}
+        species = text_tables.get('species', [])
+        if len(species) > 1:
+            result["sample"] = {"species[1]": species[1]}
+    else:
+        result["status"] = "FAILED"
+        result["_warning"] = "Fingerprints not found — character map may need tuning"
+
+    return result
+
+
 # ============ Gen V Text Decoder ============
 
 # Gen V special character substitutions (packed words for common game terms)
@@ -1101,6 +1545,12 @@ GAME_INFO = {
     # Gen IV — HGSS
     'IPK': {'gen': 4, 'narcs': {**_GEN4_HGSS}},                                                    # HeartGold
     'IPG': {'gen': 4, 'narcs': {**_GEN4_HGSS}},                                                    # SoulSilver
+    # Gen III (GBA) — offsets discovered dynamically at spotlight via _discover_gen3_tables()
+    'BPRE': {'gen': 3, 'title': 'POKÉMON FIRERED'},
+    'BPGE': {'gen': 3, 'title': 'POKÉMON LEAFGREEN'},
+    'AXVE': {'gen': 3, 'title': 'POKÉMON RUBY'},
+    'AXPE': {'gen': 3, 'title': 'POKÉMON SAPPHIRE'},
+    'BPEE': {'gen': 3, 'title': 'POKÉMON EMERALD'},
 }
 
 # Content fingerprints — universal across all Pokemon games.
@@ -1113,6 +1563,25 @@ TABLE_FINGERPRINTS = {
     'natures':        [(0, "Hardy"), (1, "Lonely"), (3, "Adamant")],
     'type_names':     [(0, "Normal"), (1, "Fighting"), (2, "Flying")],
     'tournament_names': [(4, "Champions Tournament"), (13, "Rental Tournament")],
+}
+
+# Gen III fingerprints — move/item tables start at index 0, not 1.
+# Species still starts at 1 (index 0 = dummy). Moves/items have no dummy.
+# Items are 44-byte structs — scanned separately, not as raw strings.
+TABLE_FINGERPRINTS_GEN3 = {
+    'moves':      [(0, "Pound"), (4, "Mega Punch")],
+    'items':      [(0, "Master Ball"), (3, "Poké Ball"), (12, "Potion")],
+    'type_names': [(0, "NORMAL"), (1, "FIGHT"), (2, "FLYING")],  # Gen III uses abbreviated display names
+}
+
+# Japanese content fingerprints — same indices, Japanese text.
+# Verified from Bulbapedia: はたく=Pound, メガトンパンチ=Mega Punch, etc.
+TABLE_FINGERPRINTS_JPN = {
+    'species':    [(1, "フシギダネ"), (4, "ヒトカゲ")],
+    'moves':      [(1, "はたく"), (5, "メガトンパンチ")],
+    'items':      [(1, "マスターボール")],
+    'natures':    [(0, "がんばりや"), (1, "さみしがり"), (3, "いじっぱり")],
+    'type_names': [(0, "ノーマル")],
 }
 
 # Heuristic markers — tables without unique index-based fingerprints.
@@ -1138,19 +1607,23 @@ HEURISTIC_SUBSTR = {
 
 def auto_detect_tables() -> dict:
     """Scan decoded text_tables to identify named tables by content fingerprinting."""
-    found = {}
+    # Seed with tables already set by dedicated scanners so they aren't overwritten.
+    # Use -1 as sentinel (no valid integer key is negative).
+    found = {k: -1 for k in text_tables if isinstance(k, str)}
 
     # Pass 1: exact fingerprints (entry at specific index must match)
-    for file_idx in sorted(k for k in text_tables if isinstance(k, int)):
-        strings = text_tables[file_idx]
-        if not isinstance(strings, list) or len(strings) < 2:
-            continue
-        for table_name, markers in TABLE_FINGERPRINTS.items():
-            if table_name in found:
+    # Try English first, then Japanese — same indices, different strings.
+    for fingerprint_set in (TABLE_FINGERPRINTS, TABLE_FINGERPRINTS_GEN3, TABLE_FINGERPRINTS_JPN):
+        for file_idx in sorted(k for k in text_tables if isinstance(k, int)):
+            strings = text_tables[file_idx]
+            if not isinstance(strings, list) or len(strings) < 2:
                 continue
-            if all(idx < len(strings) and strings[idx].strip().upper() == expected.upper() for idx, expected in markers):
-                text_tables[table_name] = strings
-                found[table_name] = file_idx
+            for table_name, markers in fingerprint_set.items():
+                if table_name in found:
+                    continue
+                if all(idx < len(strings) and strings[idx].strip().upper() == expected.upper() for idx, expected in markers):
+                    text_tables[table_name] = strings
+                    found[table_name] = file_idx
 
     # Pass 2: heuristic markers (all listed strings must exist in file)
     for file_idx in sorted(k for k in text_tables if isinstance(k, int)):
@@ -1394,6 +1867,67 @@ def _get_gen4_char(c: int) -> str:
         return ''
     else:
         return '?'
+
+
+def decode_gen3_trainer(header: bytes, party_data: bytes, party_flags: int) -> dict:
+    """Decode Gen III trainer header (40 bytes) and party data.
+
+    party_flags: bit 0 = has custom moves, bit 1 = has held item
+    """
+    import struct
+    if len(header) < 40:
+        return {}
+
+    flags = header[0]
+    trainer_class = header[1]
+    name_bytes = header[4:16]
+    items = [struct.unpack_from('<H', header, 16 + i*2)[0] for i in range(4)]
+    is_double = struct.unpack_from('<I', header, 24)[0]
+    ai_flags = struct.unpack_from('<I', header, 28)[0]
+    party_count = struct.unpack_from('<I', header, 32)[0]
+
+    # Decode name using Gen III charmap
+    name = ''.join(_GEN3_CHARMAP_EN.get(b, '') for b in name_bytes).strip()
+
+    # Party member size depends on flags
+    has_moves = bool(flags & 1)
+    has_item = bool(flags & 2)
+    if has_moves and has_item:
+        member_size = 18  # iv(2)+level(2)+species(2)+item(2)+moves(8)+pad(2)
+    elif has_moves:
+        member_size = 16  # iv(2)+level(2)+species(2)+moves(8)+pad(2)
+    elif has_item:
+        member_size = 8   # iv(2)+level(2)+species(2)+item(2)
+    else:
+        member_size = 8   # iv(2)+level(2)+species(2)+pad(2)
+
+    party = []
+    for i in range(min(party_count, 6)):
+        off = i * member_size
+        if off + member_size > len(party_data):
+            break
+        m = party_data[off:off+member_size]
+        iv = struct.unpack_from('<H', m, 0)[0]
+        level = struct.unpack_from('<H', m, 2)[0]
+        species = struct.unpack_from('<H', m, 4)[0]
+        member = {'species': species, 'level': level, 'iv': iv}
+        pos = 6
+        if has_item:
+            member['item'] = struct.unpack_from('<H', m, pos)[0]
+            pos += 2
+        if has_moves:
+            moves = [struct.unpack_from('<H', m, pos + j*2)[0] for j in range(4)]
+            member['moves'] = [mv for mv in moves if mv > 0]
+        party.append(member)
+
+    return {
+        'trainer_class': trainer_class,
+        'name': name,
+        'ai_flags': ai_flags,
+        'is_double': bool(is_double),
+        'battle_items': [it for it in items if it > 0],
+        'party': party,
+    }
 
 
 def decode_gen4_text(data: bytes) -> list:
@@ -1831,8 +2365,13 @@ def bootstrap_text_tables(rom, game_code: str) -> dict:
         return {}
 
     # Build reverse role map: path -> role (for _auto_decode)
+    # Start fresh — previous ROM's paths don't belong in this ROM's roles.
+    # ICR-discovered roles get re-added after BFS runs.
     global narc_roles
-    narc_roles = {path: role for role, path in game_info['narcs'].items() if role != 'text'}
+    narc_roles = {}
+    for role, path in game_info['narcs'].items():
+        if role != 'text':
+            narc_roles[path] = role
 
     try:
         narc_data = rom.getFileByName(text_narc_path)
@@ -1963,6 +2502,66 @@ def _discover_tm_table():
 
 EV_STAT_BITS = ['HP', 'Atk', 'Def', 'Spe', 'SpA', 'SpD']  # bit 0-5
 
+def _discover_gen3_tables():
+    """Find personal/move/trainer table offsets in a GBA ROM by searching for known anchors.
+
+    Same philosophy as _discover_tm_table() — the data finds itself.
+    Results stored in current_rom['gen3_offsets'].
+    """
+    if not current_rom or current_rom['type'] != 'gba':
+        return None
+    rom_data = bytes(current_rom.get('data') or b'')
+    if not rom_data:
+        return None
+
+    offsets = {}
+
+    # ── Personal data: find via Bulbasaur's unique stat+type+catch signature ──
+    # HP=45, Atk=49, Def=49, Spe=45, SpA=65, SpD=65, Type1=12(Grass), Type2=3(Poison), Catch=45
+    bulb_sig = bytes([45, 49, 49, 45, 65, 65, 12, 3, 45])
+    idx = rom_data.find(bulb_sig)
+    if idx >= 0:
+        # Bulbasaur is species index 1 → base = found - 1 * 28
+        offsets['personal_base'] = idx - 28
+        offsets['personal_size'] = 28
+
+    # ── Move data: find via Pound's signature with blank entry before it ──
+    # effect=0, power=40, type=0(Normal), acc=100, pp=35
+    pound_sig = bytes([0, 40, 0, 100, 35])
+    idx = rom_data.find(pound_sig)
+    while idx >= 0:
+        if all(b == 0 for b in rom_data[idx - 12: idx]):
+            offsets['move_base'] = idx - 12  # entry 0 = blank, entry 1 = Pound
+            offsets['move_size'] = 12
+            break
+        idx = rom_data.find(pound_sig, idx + 1)
+
+    # ── Learnset pointer table: find via species 1 (Bulbasaur) lv1 Tackle ──
+    # Table is an array of GBA pointers, one per species. Each points to u16 pairs
+    # (level << 9) | move_id, terminated by 0x0000.
+    tackle_lv1 = struct.pack('<H', (1 << 9) | 33)  # 0x0221
+    for i in range(0, min(len(rom_data) - 8, 0x800000), 4):
+        ptr = struct.unpack_from('<I', rom_data, i)[0]
+        if not (0x08000000 <= ptr <= 0x0A000000):
+            continue
+        off = ptr - 0x08000000
+        if off + 2 <= len(rom_data) and rom_data[off:off+2] == tackle_lv1:
+            ptr2 = struct.unpack_from('<I', rom_data, i + 4)[0]
+            if 0x08000000 <= ptr2 <= 0x0A000000:
+                off2 = ptr2 - 0x08000000
+                if off2 + 2 <= len(rom_data) and rom_data[off2:off2+2] == tackle_lv1:
+                    offsets['learnset_ptr_table'] = i - 4  # entry 0 = dummy
+                    break
+
+    # ── Trainer data: no global base needed — search by name at query time ──
+    offsets['trainer_size'] = 40
+
+    if offsets:
+        current_rom['gen3_offsets'] = offsets
+
+    return offsets if offsets else None
+
+
 def decode_ev_spread(byte_val):
     """Decode EV bitmask: each set bit = 252 EVs in that stat."""
     stats = [EV_STAT_BITS[i] for i in range(6) if byte_val & (1 << i)]
@@ -2002,14 +2601,14 @@ def get_ability_from_personal(species_id: int, ability_slot: int) -> str:
                 aid = abilities[ability_slot]
                 return ability_list[aid] if aid < len(ability_list) else f"ability#{aid}"
         else:
-            # Gen V: abilities at 0x18, 0x1A, 0x1C (u16, slot 0/1/2 = normal/normal/hidden)
-            if len(personal_data) < 0x1E:
+            # Gen V: abilities at 0x18, 0x19, 0x1A (u8, slot 0/1/2 = normal/normal/hidden)
+            if len(personal_data) < 0x1B:
                 return f"ability_slot_{ability_slot}"
             abilities = []
             for i in range(3):
-                off = 0x18 + i * 2
-                if off + 2 <= len(personal_data):
-                    aid = struct.unpack_from('<H', personal_data, off)[0]
+                off = 0x18 + i
+                if off < len(personal_data):
+                    aid = personal_data[off]
                     abilities.append(aid)
             if ability_slot < len(abilities):
                 aid = abilities[ability_slot]
@@ -2129,14 +2728,17 @@ def decode_trpoke(data: bytes, trainer_data: bytes = None) -> dict:
 
 
 def decode_trdata(data: bytes, index: int = None) -> dict:
-    """Decode a TRData entry into human-readable format."""
-    if len(data) < 20:
+    """Decode a TRData entry into human-readable format.
+    Gen IV: 16 bytes (flags, class, battle_type, npoke, items×4, ai_flags)
+    Gen V:  20 bytes (+ pad, prize_base, area_id, pad)"""
+    gen = text_gen or 5
+    min_len = 16 if gen <= 4 else 20
+    if len(data) < min_len:
         return None
     
     trainer_names = text_tables.get('trainer_names', [])
     trainer_classes = text_tables.get('trainer_classes', [])
     items_list = text_tables.get('items', [])
-    gen = text_gen or 5
 
     BATTLE_TYPES = {0: "Single", 1: "Double", 2: "Triple", 3: "Rotation"}
 
@@ -2156,9 +2758,11 @@ def decode_trdata(data: bytes, index: int = None) -> dict:
 
     ai_flags_raw = struct.unpack_from('<I', data, 12)[0]
     ai_flags = decode_ai_flags(ai_flags_raw, gen)
-    prize_money_base = data[17]
-    area_id = data[18]
     class_name = trainer_classes[trainer_class] if trainer_class < len(trainer_classes) else f"class#{trainer_class}"
+
+    # Gen V has extra fields at 16-19, Gen IV does not
+    prize_money_base = data[17] if len(data) > 17 else 0
+    area_id = data[18] if len(data) > 18 else 0
 
     result = {
         "class": class_name,
@@ -2488,6 +3092,18 @@ EV_YIELD_STATS = ['HP', 'Atk', 'Def', 'Spe', 'SpA', 'SpD']
 
 EXP_GROWTH_NAMES = {0: "Medium Fast", 1: "Erratic", 2: "Fluctuating", 3: "Medium Slow", 4: "Fast", 5: "Slow"}
 
+EGG_GROUP_NAMES = {
+    0: "—", 1: "Monster", 2: "Water 1", 3: "Bug", 4: "Flying", 5: "Field",
+    6: "Fairy", 7: "Grass", 8: "Human-Like", 9: "Water 3", 10: "Mineral",
+    11: "Amorphous", 12: "Water 2", 13: "Ditto", 14: "Dragon", 15: "Undiscovered",
+}
+
+GENDER_RATIOS = {
+    0: "100% ♂", 31: "87.5% ♂ / 12.5% ♀", 63: "75% ♂ / 25% ♀",
+    127: "50% ♂ / 50% ♀", 191: "25% ♂ / 75% ♀", 223: "12.5% ♂ / 87.5% ♀",
+    254: "100% ♀", 255: "Genderless",
+}
+
 def decode_personal(data: bytes, file_idx: int = 0):
     """Decode personal data. Gen IV=44B, Gen V=76B. Returns positional text."""
     if len(data) < 28 or data == b'\x00' * len(data):
@@ -2531,9 +3147,9 @@ def decode_personal(data: bytes, file_idx: int = 0):
         egg1, egg2 = data[0x16], data[0x17]
         ability_names = []
         for i in range(3):
-            off = 0x18 + i * 2
-            if off + 2 <= len(data):
-                aid = struct.unpack_from('<H', data, off)[0]
+            off = 0x18 + i
+            if off < len(data):
+                aid = data[off]
                 if aid > 0:
                     name = ability_list[aid] if aid < len(ability_list) else f"ability#{aid}"
                     ability_names.append(f"{name} (Hidden)" if i == 2 else name)
@@ -2554,8 +3170,12 @@ def decode_personal(data: bytes, file_idx: int = 0):
     lines.append(f"{types_str} | BST {bst}")
     lines.append(f"HP {hp} | Atk {atk} | Def {dfn} | SpA {spa} | SpD {spd} | Spe {spe}")
     lines.append(f"Abilities: {' / '.join(ability_names)}" if ability_names else "Abilities: ---")
-    lines.append(f"Catch Rate: {catch_rate} | Hatch: {hatch_cycles} cycles | Happiness: {base_happiness}")
-    lines.append(f"Growth: {EXP_GROWTH_NAMES.get(exp_growth, f'#{exp_growth}')} | Egg Groups: {egg1}, {egg2}")
+    gender_str = GENDER_RATIOS.get(gender, f"ratio {gender}")
+    lines.append(f"Gender: {gender_str} | Catch Rate: {catch_rate} | Hatch: {hatch_cycles} cycles | Happiness: {base_happiness}")
+    eg1 = EGG_GROUP_NAMES.get(egg1, f"#{egg1}")
+    eg2 = EGG_GROUP_NAMES.get(egg2, f"#{egg2}")
+    egg_str = eg1 if egg1 == egg2 else f"{eg1} / {eg2}"
+    lines.append(f"Growth: {EXP_GROWTH_NAMES.get(exp_growth, f'#{exp_growth}')} | Egg Groups: {egg_str}")
     if held_parts:
         lines.append(f"Held Items: {' / '.join(held_parts)}")
     if evs:
@@ -2698,7 +3318,16 @@ def decode_move_data(data: bytes, file_idx: int = 0):
     moves_list = text_tables.get('moves', [])
     move_name = moves_list[file_idx] if file_idx < len(moves_list) else f"move#{file_idx}"
 
-    if gen <= 4 and len(data) >= 12:
+    if gen == 3 and len(data) >= 9:
+        # Gen III: effect(1), power(1), type(1), accuracy(1), pp(1)
+        move_type = data[2]
+        power = data[1]
+        accuracy = data[3]
+        pp = data[4]
+        type_name = type_list[move_type] if move_type < len(type_list) else f"type#{move_type}"
+        category = '—'
+        extras = []
+    elif gen <= 4 and len(data) >= 12:
         category = MOVE_CATEGORIES_G4.get(data[2], f"cat#{data[2]}")
         power = data[3]
         move_type = data[4]
@@ -2748,291 +3377,6 @@ def decode_encounters(data: bytes) -> dict:
             return _decode_encounters_dpp(data)
 
     return None
-
-
-# Encounter NARC file index (a/1/2/7) -> location_names text table index
-# Corrected mapping from script cross-reference against known BW2 location species.
-# Zone header u16[2] stores internal zone IDs, NOT location_names text indices.
-_B2W2_ENC_LOC = {
-    0:6, 1:8, 2:21,                                          # Striaton City, Castelia City, Route 8
-    3:117, 4:118, 5:119,                                     # Aspertia City, Virbank City, Humilau City
-    6:32, 7:32,                                              # Dreamyard
-    8:33, 9:72,                                              # Pinwheel Forest, Lostlorn Forest
-    10:34, 11:34,                                            # Desert Resort
-    12:35, 13:35, 14:35, 15:35, 16:35, 17:35, 18:35, 19:35, # Relic Castle
-    20:37, 21:37, 22:37,                                     # Chargestone Cave
-    23:38, 24:38, 25:38, 26:38,                              # Twist Mountain
-    27:39, 28:39, 29:39, 30:39,                              # Dragonspiral Tower
-    31:134,                                                  # Victory Road (BW2)
-    32:61, 33:61, 34:61, 35:61, 36:61,                      # Giant Chasm
-    37:129, 38:129, 39:129, 40:129, 41:129,                  # Castelia Sewers
-    42:63,                                                   # P2 Laboratory
-    43:71,                                                   # Undella Bay
-    44:130, 45:130,                                          # Floccesy Ranch
-    46:131, 47:131,                                          # Virbank Complex
-    48:132, 49:132, 50:132, 51:132, 52:132, 53:132,         # Reversal Mountain
-    54:132, 55:132, 56:132, 57:132, 58:132, 59:132, 60:132,
-    61:133, 62:133, 63:133, 64:133, 65:133,                  # Strange House
-    66:133, 67:133, 68:133, 69:133, 70:133,
-    71:134, 72:134, 73:134, 74:134, 75:134,                  # Victory Road (BW2)
-    76:134, 77:134, 78:134, 79:134, 80:134,
-    81:136, 82:136, 83:136,                                  # Relic Passage
-    84:137, 85:137, 86:137,                                  # Clay Tunnel
-    87:149, 88:149, 89:149,                                  # Underground Ruins
-    90:150,                                                  # Rock Peak Chamber
-    91:151,                                                  # Iceberg Chamber
-    92:152,                                                  # Iron Chamber
-    93:141, 94:141,                                          # Seaside Cave
-    95:147,                                                  # Nature Preserve
-    96:65, 97:67, 98:68,                                     # Driftveil Drawbridge, Village Bridge, Marvelous Bridge
-    99:14, 100:15, 101:16,                                   # Route 1, Route 2, Route 3
-    102:53, 103:53,                                          # Wellspring Cave
-    104:17, 105:17,                                          # Route 4
-    106:18, 107:19,                                          # Route 5, Route 6
-    108:54, 109:54,                                          # Mistralton Cave
-    110:74,                                                  # Guidance Chamber
-    111:20,                                                  # Route 7
-    112:56, 113:56, 114:56, 115:56,                          # Celestial Tower
-    116:21,                                                  # Route 8
-    117:57,                                                  # Moor of Icirrus
-    118:22,                                                  # Route 9
-    119:24, 120:25, 121:26, 122:27,                          # Route 11, Route 12, Route 13, Route 14
-    123:70,                                                  # Abundant Shrine
-    124:28, 125:29,                                          # Route 15, Route 16
-    126:72,                                                  # Lostlorn Forest
-    127:31,                                                  # Route 18
-    128:124, 129:125,                                        # Route 19, Route 20
-    130:127, 131:128,                                        # Route 22, Route 23
-    132:42,                                                  # Undella Town
-    133:30,                                                  # Route 17
-    134:126,                                                 # Route 21
-}
-
-# Encounter NARC file index (a/1/2/6) -> location_names text table index
-# Corrected mapping from script cross-reference against known BW1 location species.
-_BW1_ENC_LOC = {
-    0:6, 1:8,                                                # Striaton City, Castelia City (surf)
-    2:21,                                                    # Route 8
-    3:32, 4:32,                                              # Dreamyard
-    5:33, 6:33,                                              # Pinwheel Forest
-    7:34, 8:34,                                              # Desert Resort
-    9:35, 10:35, 11:35, 12:35, 13:35, 14:35,                # Relic Castle
-    15:35, 16:35, 17:35, 18:35, 19:35, 20:35,
-    21:35, 22:35, 23:35, 24:35, 25:35, 26:35,
-    27:35, 28:35, 29:35, 30:35, 31:35, 32:35,
-    33:35, 34:35, 35:35, 36:35, 37:35, 38:35, 39:35,
-    40:36,                                                   # Cold Storage
-    41:37, 42:37, 43:37,                                     # Chargestone Cave
-    44:38, 45:38, 46:38, 47:38,                              # Twist Mountain
-    48:20, 49:20,                                            # Route 7
-    50:39, 51:39,                                            # Dragonspiral Tower
-    52:40, 53:40, 54:40, 55:40, 56:40, 57:40,               # Victory Road
-    58:40, 59:40, 60:40, 61:40, 62:40, 63:40,
-    64:40, 65:40, 66:40, 67:40,
-    68:26,                                                   # Route 13
-    69:61, 70:61, 71:61,                                     # Giant Chasm
-    72:63,                                                   # P2 Laboratory
-    73:71,                                                   # Undella Bay
-    74:0, 76:0,                                              # Empty/unused
-    75:67,                                                   # Village Bridge
-    77:14, 78:15, 79:16,                                     # Route 1, Route 2, Route 3
-    80:53, 81:53,                                            # Wellspring Cave
-    82:17,                                                   # Route 4
-    83:18,                                                   # Route 5
-    84:19,                                                   # Route 6
-    85:54, 86:54, 87:54,                                     # Mistralton Cave
-    88:20,                                                   # Route 7
-    89:56, 90:56, 91:56, 92:56,                              # Celestial Tower
-    93:57, 94:57,                                            # Moor of Icirrus
-    95:22,                                                   # Route 9
-    96:59, 97:59, 98:59,                                     # Challenger's Cave
-    99:23, 100:23,                                           # Route 10
-    101:24,                                                  # Route 11
-    102:25,                                                  # Route 12
-    103:26,                                                  # Route 13
-    104:27,                                                  # Route 14
-    105:70,                                                  # Abundant Shrine
-    106:28,                                                  # Route 15
-    107:29,                                                  # Route 16
-    108:72,                                                  # Lostlorn Forest
-    109:31,                                                  # Route 18
-    110:30,                                                  # Route 17
-    111:42,                                                  # Undella Town
-}
-
-# Encounter NARC file index (fielddata/encountdata/pl_enc_data.narc) -> location_names text index
-# Built by species cross-reference against Platinum location list.
-# Platinum has NO flat enc->loc in ARM9 (stride 6 is garbage). Hardcoded like HGSS.
-_CPU_ENC_LOC = {
-    5:46, 6:46,                                             # Oreburgh Mine
-    7:47,                                                   # Valley Windworks
-    8:48,                                                   # Eterna Forest
-    9:28,                                                   # Route 213
-    10:22, 21:22,                                           # Route 207
-    11:50, 12:50, 13:50, 14:50, 15:50, 16:50, 17:50,       # Mt. Coronet
-    18:50, 19:50, 20:50, 22:50,                             # Mt. Coronet
-    23:45, 24:45, 25:45, 26:45, 27:45, 28:45,              # Route 230
-    29:53, 30:53, 31:53, 32:53, 33:53, 34:53, 35:53,       # Solaceon Ruins (Unown)
-    36:53, 37:53, 38:53, 39:53, 40:53, 41:53, 42:53,       # Solaceon Ruins (Unown)
-    43:53, 44:53, 45:53, 46:53,                             # Solaceon Ruins (Unown)
-    47:54, 48:54, 49:54, 50:54, 51:54, 52:54,              # Victory Road
-    53:57, 54:57, 55:57,                                    # Ravaged Path
-    56:41, 57:41,                                           # Route 226
-    58:84,                                                  # Stark Mountain
-    59:73,                                                  # Valor Lakefront
-    60:70, 63:70, 64:70, 65:70, 66:70, 67:70, 68:70,       # Old Chateau
-    61:117, 62:117,                                         # Distortion World
-    69:117, 70:117, 71:117, 72:117, 73:117, 74:117,         # Distortion World
-    75:117, 76:117, 77:117, 78:117, 79:117, 80:117,         # Distortion World
-    81:117, 82:117, 83:117, 84:117, 85:117, 86:117,         # Distortion World
-    87:117, 88:117, 89:117, 90:117, 91:117, 92:117,         # Distortion World
-    93:117, 94:117, 95:117, 96:117, 97:117, 98:117,         # Distortion World
-    99:117, 100:117, 101:117, 102:117, 103:117, 104:117,    # Distortion World
-    105:117,                                                # Distortion World
-    106:32, 107:32, 108:32, 109:32, 110:32, 111:32,        # Route 217 (Jynx/Sneasel/Smoochum)
-    112:46,                                                 # Oreburgh Mine
-    113:65,                                                 # Wayward Cave (Gible)
-    114:66, 115:66, 116:66,                                 # Ruin Maniac Cave (Hippopotas)
-    117:68,                                                 # Trophy Garden (Pikachu)
-    119:50,                                                 # Mt. Coronet
-    120:69, 121:69, 122:69, 123:69, 124:69,                # Iron Island
-    125:62, 126:62, 127:62, 128:62, 129:62,                # Turnback Cave (Gastly)
-    130:62, 131:62, 132:62, 133:62,                        # Turnback Cave (Gastly)
-    134:16, 135:16,                                        # Route 201
-    136:76,                                                # Lake Verity
-    137:31,                                                # Route 216
-    138:29,                                                # Route 214
-    139:31,                                                # Route 216
-    140:17, 141:17, 142:17, 143:17, 144:17,               # Route 202
-    145:20,                                                # Route 205
-    146:48,                                                # Eterna Forest
-    147:21, 148:21,                                        # Route 206
-    149:23, 150:23,                                        # Route 208
-    151:70, 152:70, 153:70, 154:70, 155:70,               # Old Chateau (Gastly/Golbat)
-    156:21,                                                # Route 206
-    157:22, 158:22, 159:50,                                # Route 207 / Mt. Coronet
-    160:23,                                                # Route 208
-    161:27,                                                # Route 212 (Croagunk)
-    162:28,                                                # Route 213
-    163:29,                                                # Route 214
-    164:30,                                                # Route 215
-    165:32,                                                # Route 217
-    166:31,                                                # Route 216
-    167:28,                                                # Route 213
-    169:36,                                                # Route 221
-    170:37,                                                # Route 222
-    171:44,                                                # Route 229
-    172:54,                                                # Victory Road
-    173:41,                                                # Route 226
-    174:43,                                                # Route 228
-    175:44,                                                # Route 229
-    181:54,                                                # Victory Road
-    182:28,                                                # Route 213
-}
-
-# Encounter NARC file index (a/1/3/6) -> location_names text table index (a/0/2/7:279)
-# Built by species cross-reference: each encounter file's species composition was matched
-# to known HGSS locations. HGSS has NO flat enc->loc table in the binary (unlike DP/Pt) —
-# the game resolves encounters through map headers at runtime. 142 entries, all verified.
-_HGSS_ENC_LOC = {
-    0: 126,                                              # New Bark Town
-    1: 177,                                              # Route 29
-    2: 127,                                              # Cherrygrove City
-    3: 178,                                              # Route 30
-    4: 179,                                              # Route 31
-    5: 128,                                              # Violet City
-    6: 204, 7: 204,                                      # Sprout Tower
-    8: 180,                                              # Route 32
-    9: 209, 10: 209, 11: 209, 12: 209, 13: 209,         # Ruins of Alph
-    14: 210, 15: 210, 16: 210,                           # Union Cave
-    17: 181,                                              # Route 33
-    18: 211, 19: 211,                                    # SLOWPOKE Well
-    20: 214,                                              # Ilex Forest
-    21: 182,                                              # Route 34
-    22: 183,                                              # Route 35
-    23: 207, 24: 207,                                    # National Park
-    25: 184,                                              # Route 36
-    26: 185,                                              # Route 37
-    27: 133,                                              # Ecruteak City
-    28: 206, 29: 206,                                    # Burned Tower
-    30: 205, 31: 205, 32: 205, 33: 205,                 # Bell Tower
-    34: 205, 35: 205, 36: 205, 37: 205,
-    38: 186,                                              # Route 38
-    39: 187,                                              # Route 39
-    40: 132,                                              # Olivine City
-    41: 188,                                              # Route 40
-    42: 189,                                              # Route 41
-    43: 218, 44: 218, 45: 218, 46: 218,                 # Whirl Islands
-    47: 218, 48: 218, 49: 218, 50: 218,
-    51: 130,                                              # Cianwood City
-    52: 190,                                              # Route 42
-    53: 216, 54: 216, 55: 216, 56: 216,                 # Mt. Mortar
-    57: 191,                                              # Route 43
-    58: 135,                                              # Lake of Rage
-    59: 192,                                              # Route 44
-    60: 217, 61: 217, 62: 217, 63: 217,                 # Ice Path
-    64: 136,                                              # Blackthorn City
-    65: 136,                                              # Blackthorn City
-    66: 222,                                              # Dragon's Den
-    67: 193,                                              # Route 45
-    68: 194,                                              # Route 46
-    69: 220, 70: 220,                                    # Dark Cave
-    71: 195,                                              # Route 47
-    72: 196, 73: 196,                                    # Route 48
-    74: 228, 75: 228, 76: 228, 77: 228, 78: 228,       # Cliff Cave
-    79: 219, 80: 219, 81: 219, 82: 219,                 # Mt. Silver Cave
-    83: 234,                                              # Cliff Edge Gate
-    84: 227,                                              # Safari Zone Gate
-    85: 176,                                              # Route 28
-    86: 219, 87: 219, 88: 219, 89: 219,                 # Mt. Silver Cave
-    90: 137,                                              # Mt. Silver
-    91: 174,                                              # Route 26
-    92: 175,                                              # Route 27
-    93: 223,                                              # Tohjo Falls
-    94: 175,                                              # Route 27
-    95: 174,                                              # Route 26
-    96: 143,                                              # Vermilion City
-    97: 139,                                              # Viridian City
-    98: 138,                                              # Pallet Town
-    99: 144,                                              # Celadon City
-    100: 145,                                             # Fuchsia City
-    101: 146,                                             # Cinnabar Island
-    102: 195,                                             # Route 47
-    103: 161,                                             # Route 13
-    104: 162,                                             # Route 14
-    105: 176,                                             # Route 28
-    106: 198, 107: 198,                                  # Mt. Moon
-    108: 200, 109: 200,                                  # Rock Tunnel
-    110: 221,                                             # Victory Road
-    111: 149,                                             # Route 1
-    112: 150,                                             # Route 2
-    113: 151,                                             # Route 3
-    114: 152,                                             # Route 4
-    115: 153,                                             # Route 5
-    116: 154,                                             # Route 6
-    117: 155,                                             # Route 7
-    118: 156,                                             # Route 8
-    119: 157,                                             # Route 9
-    120: 158,                                             # Route 10
-    121: 159,                                             # Route 11
-    122: 161,                                             # Route 13
-    123: 162,                                             # Route 14
-    124: 163,                                             # Route 15
-    125: 164,                                             # Route 16
-    126: 165,                                             # Route 17
-    127: 166,                                             # Route 18
-    128: 169,                                             # Route 21
-    129: 170,                                             # Route 22
-    130: 172,                                             # Route 24
-    131: 173,                                             # Route 25
-    132: 223,                                             # Tohjo Falls
-    133: 197,                                             # Diglett's Cave
-    134: 221, 135: 221,                                  # Victory Road
-    136: 150,                                             # Route 2
-    137: 224,                                             # Viridian Forest
-    138: 226,                                             # S.S. Aqua
-    139: 199, 140: 199, 141: 199,                        # Cerulean Cave
-}
 
 # (species_id, form_idx) -> parenthetical label appended to species name in encounter display
 # Form 0 entries are included when the base form has a meaningful name (e.g. Basculin Red-Striped)
@@ -3690,23 +4034,33 @@ def format_trainer(file_idx):
 
         class_name = trdata.get('class', '???')
         trainer_name = trdata.get('name', f'Trainer #{file_idx}')
+        battle_type = trdata.get('battle_type', 'Single')
 
         # Look up location for special trainers (Gym Leaders, E4, Champions, etc.)
         game_code = current_rom['header']['game_code'] if current_rom else None
         location = get_trainer_location(game_code, class_name, trainer_name) if game_code else None
         
+        # Title line: "Leader Cheren - Aspertia Gym" or "Leader Cheren"
         if location:
             lines = [f"{class_name} {trainer_name} - {location}"]
         else:
             lines = [f"{class_name} {trainer_name}"]
 
+        # Battle format (only show if not Single — Single is default)
+        if battle_type != 'Single':
+            lines[0] += f"  [{battle_type} Battle]"
+
         _chal_delta = get_bw2_challenge_delta(file_idx, game_code)
-
-
 
         _gen = text_gen or 5
         pokemon = trpoke.get('pokemon', [])
-        for poke in pokemon:
+
+        # Team header
+        if pokemon:
+            lines.append("")
+            lines.append("Team:")
+
+        for pi, poke in enumerate(pokemon):
             species = poke.get('species', '???')
             species_id = poke.get('species_id', 0)
             level = poke.get('level', '?')
@@ -3757,16 +4111,27 @@ def format_trainer(file_idx):
         footer = []
         if prize > 0:
             footer.append(f"Prize: ¥{prize:,}")
+
+        # Items used in battle (Potions, Full Restores, etc.)
         items = trdata.get('battle_items', 'None')
         if isinstance(items, list) and items:
             footer.append(f"Items: {', '.join(items)}")
+        else:
+            footer.append("No Items")
+
+        # AI flags (only show if not just "None")
+        ai = trdata.get('ai_flags', [])
+        if ai and ai != ['None']:
+            footer.append(f"AI: {', '.join(ai)}")
+
         if footer:
             lines.append("")
             lines.append(" | ".join(footer))
 
         return "\n".join(lines)
-    except Exception:
-        return None
+    except Exception as e:
+        import traceback
+        return f"[format_trainer error] {e}\n{traceback.format_exc()}"
 
 
 def _format_hex(data: bytes, base_offset: int = 0) -> str:
@@ -3800,8 +4165,98 @@ def _notes_for_path(path: str) -> str:
     return '\n'.join(hits)
 
 
-def _auto_decode(path: str, data: bytes):
+def _auto_decode(path: str, data: bytes, _rom=None):
     """Auto-decode known structures by role, not hardcoded paths."""
+    # GBA/GB/GBC: binary ROM — role:key paths, no NARCs
+    # Use _rom snapshot to avoid race with BFS background threads switching current_rom
+    _active = _rom or current_rom
+    if _active and _active['type'] in ('gba', 'gb', 'gbc'):
+        rom_data = bytes(_active.get('data') or b'')
+        if not rom_data:
+            return {"_unknown": True, "reason": "ROM data not loaded"}
+        offsets = _active.get('gen3_offsets', {})
+        gc = _active['header']['game_code']
+        if ':' not in path:
+            off = int(path, 16) if path.startswith('0x') else int(path)
+            return {"path": path, "hex": _format_hex(rom_data[off: off + 64], off)}
+        role, key = path.split(':', 1)
+        key = key.strip()
+        if role == 'personal':
+            base = offsets.get('personal_base', 0)
+            if not base:
+                return {"_unknown": True, "reason": f"personal offset not discovered for {gc}"}
+            idx = int(key) if key.isdigit() else next(
+                (i for i, n in enumerate(text_tables.get('species', [])) if n.strip().upper() == key.upper()), -1)
+            if idx < 0:
+                return {"_unknown": True, "reason": f"Species not found: {key}"}
+            return decode_personal(rom_data[base + idx * 28: base + idx * 28 + 28], idx)
+        elif role == 'trainer':
+            reverse = {v: k for k, v in _GEN3_CHARMAP_EN.items() if isinstance(v, str) and len(v) == 1}
+            try:
+                name_bytes = bytes([reverse[c] for c in key.upper()]) + b'\xff'
+            except KeyError:
+                return {"_unknown": True, "reason": f"Unsupported characters in name: {key}"}
+            entry_offset, search_start = -1, 0
+            while True:
+                name_off = rom_data.find(name_bytes, search_start)
+                if name_off < 4: break
+                chunk = rom_data[name_off - 4: name_off + 36]
+                count_v = struct.unpack_from('<I', chunk, 32)[0]
+                ptr_v   = struct.unpack_from('<I', chunk, 36)[0]
+                if chunk[0] <= 3 and chunk[1] < 200 and 1 <= count_v <= 6 and 0x08000000 <= ptr_v <= 0x0AFFFFFF:
+                    entry_offset = name_off - 4
+                    break
+                search_start = name_off + 1
+            if entry_offset < 0:
+                return {"_unknown": True, "reason": f"Trainer not found: {key}"}
+            header = rom_data[entry_offset: entry_offset + 40]
+            flags = header[0]
+            party_count = struct.unpack_from('<I', header, 32)[0]
+            party_ptr   = struct.unpack_from('<I', header, 36)[0]
+            party_off   = party_ptr - 0x08000000 if party_ptr >= 0x08000000 else 0
+            has_moves, has_item = bool(flags & 1), bool(flags & 2)
+            msize = 18 if (has_moves and has_item) else 16 if has_moves else 8
+            party_data = rom_data[party_off: party_off + party_count * msize] if party_off else b''
+            decoded = decode_gen3_trainer(header, party_data, flags)
+            return _format_gen3_trainer(decoded) if decoded else {"_unknown": True, "reason": f"Trainer not found: {key}"}
+        elif role == 'learnset':
+            ptr_table = offsets.get('learnset_ptr_table', 0)
+            if not ptr_table:
+                return {"_unknown": True, "reason": f"learnset offset not discovered for {gc}"}
+            idx = int(key) if key.isdigit() else next(
+                (i for i, n in enumerate(text_tables.get('species', [])) if n.strip().upper() == key.upper()), -1)
+            if idx < 0:
+                return {"_unknown": True, "reason": f"Species not found: {key}"}
+            ptr = struct.unpack_from('<I', rom_data, ptr_table + idx * 4)[0]
+            off = ptr - 0x08000000
+            moves_list = text_tables.get('moves', [])
+            sp_name = (text_tables.get('species') or [f'#{idx}'])[idx] if idx < len(text_tables.get('species', [])) else f'#{idx}'
+            lines = [f"{sp_name} (#{idx}) — Learnset"]
+            i = off
+            while i + 2 <= len(rom_data):
+                entry = struct.unpack_from('<H', rom_data, i)[0]
+                if entry == 0xFFFF or entry == 0:
+                    break
+                level, move_id = entry >> 9, entry & 0x1FF
+                # Gen III move table is 0-indexed (Pound=0), ROM IDs are 1-indexed (Pound=1)
+                mv_idx = move_id - 1
+                mv = moves_list[mv_idx] if 0 <= mv_idx < len(moves_list) else f"move#{move_id}"
+                lines.append(f"  Lv{level:3d}  {mv}")
+                i += 2
+            return "\n".join(lines)
+        elif role == 'move':
+            base = offsets.get('move_base', 0)
+            if not base:
+                return {"_unknown": True, "reason": f"move offset not discovered for {gc}"}
+            idx = int(key) if key.isdigit() else next(
+                (i for i, n in enumerate(text_tables.get('moves', [])) if n.strip().upper() == key.upper()), -1)
+            if idx < 0:
+                return {"_unknown": True, "reason": f"Move not found: {key}"}
+            # Gen III: ROM index 0=blank, 1=Pound. Text table index 0=Pound. Add 1 to convert.
+            rom_idx = idx + 1
+            return decode_move_data(rom_data[base + rom_idx * 12: base + rom_idx * 12 + 12], idx)
+        return {"_unknown": True, "reason": f"Unknown role '{role}'. Use personal/trainer/learnset/move"}
+
     if not narc_roles or ':' not in path:
         return {"_unknown": True, "reason": "no role mapping", "hint": f"scope({path}) for raw bytes"}
 
@@ -3832,18 +4287,17 @@ def _auto_decode(path: str, data: bytes):
                 # Resolve location name -- use game-specific mapping
                 gc = current_rom['header']['game_code'] if current_rom else ''
                 loc_id = 0
-                if gc in ('IRE', 'IRD'):  # Black 2 / White 2
-                    loc_id = _B2W2_ENC_LOC.get(file_idx, 0)
-                elif gc in ('IRB', 'IRA'):  # Black / White
-                    loc_id = _BW1_ENC_LOC.get(file_idx, 0)
-                elif gc in ('ADA', 'APA'):  # Diamond / Pearl
+                # Auto-built table from BFS (preferred — no hardcoding)
+                auto_table = _auto_enc_loc.get(gc, {})
+                if auto_table:
+                    loc_id = auto_table.get(file_idx, 0)
+                elif gc in ('ADA', 'APA'):  # Diamond / Pearl — ARM9 table
                     arm9 = current_rom.get('arm9_data')
                     if arm9 and 0xED738 + file_idx * 2 + 2 <= len(arm9):
                         loc_id = struct.unpack_from('<H', arm9, 0xED738 + file_idx * 2)[0]
-                elif gc == 'CPU':  # Platinum
-                    loc_id = _CPU_ENC_LOC.get(file_idx, 0)
-                elif gc in ('IPK','IPG'):  # HG/SS
-                    loc_id = _HGSS_ENC_LOC.get(file_idx, 0)
+                else:
+                    # No auto-built table and not DP ARM9 — BFS didn't find zone headers
+                    pass
                 if loc_id:
                     location_names = text_tables.get('location_names', [])
                     decoded['location'] = location_names[loc_id] if loc_id < len(location_names) else f'Area #{file_idx}'
@@ -3874,8 +4328,8 @@ def _auto_decode(path: str, data: bytes):
             return decode_contest(data, file_idx)
         elif role == 'items':
             return decode_items(data, file_idx)
-    except Exception:
-        pass
+    except Exception as e:
+        return {"_error": f"Decoder crash: {e}", "role": role}
 
     return None
 
@@ -3889,7 +4343,7 @@ def _auto_decode(path: str, data: bytes):
 
 async def spotlight(path: str) -> dict:
     """Open a ROM file for exploration. Multiple ROMs can be open simultaneously."""
-    global current_rom, current_flipnote
+    global current_rom, current_flipnote, text_gen, _user_active_gc
 
     ensure_dirs()
     rom_type = detect_rom_type(path)
@@ -3904,17 +4358,26 @@ async def spotlight(path: str) -> dict:
 
     gc = header['game_code']
 
-    # Already loaded? Just switch to it
+    # Already loaded? Switch to it — but still show the full summary card
     if gc in loaded_roms:
         _save_active_state()
         _restore_state(gc)
-        result = {
-            "rom_type": rom_type, "game_code": gc,
-            "game_title": header['game_title'], "region": header['region'],
-            "flipnote": current_flipnote['path'],
-            "switched": True, "loaded": list(loaded_roms.keys())
-        }
-        return result
+        game_info = GAME_INFO.get(gc, {})
+        narcs = game_info.get("narcs", {})
+        lines = [
+            f"{header['game_title']} ({gc}) — {header['region']}",
+            f"Type: {rom_type}  |  Loaded: {list(loaded_roms.keys())}",
+        ]
+        detected = [k for k, v in text_tables.items() if isinstance(v, list) and isinstance(k, str)]
+        if detected:
+            lines.append(f"Text: Gen {text_gen} decoded — tables: {', '.join(detected)}")
+        key_roles = ("trdata", "trpoke", "personal", "learnsets", "encounters", "items")
+        for role in key_roles:
+            if role in narcs: lines.append(f"  {role}: {narcs[role]}")
+        lines.append(f"Flipnote: {current_flipnote['path']}")
+        _user_active_gc = gc
+        return {"_card": True, "text": "\n".join(lines), "game_code": gc,
+                "switched": True, "loaded": list(loaded_roms.keys())}
 
     # Save current ROM state before loading new one
     _save_active_state()
@@ -4008,7 +4471,6 @@ async def spotlight(path: str) -> dict:
         }
 
         # Pre-set text_gen before bootstrapping text tables
-        global text_gen
         game_info = GAME_INFO.get(gc, {})
         text_gen = game_info.get('gen')
 
@@ -4023,16 +4485,42 @@ async def spotlight(path: str) -> dict:
         if tm_count:
             text_table_result["tm_table"] = f"{tm_count} TM/HM entries found"
 
+        # Seed narc_roles from GAME_INFO so decoders work before BFS completes
+        game_info = GAME_INFO.get(gc, {})
+        for role, narc_path in game_info.get('narcs', {}).items():
+            if role != 'text' and narc_path not in narc_roles:
+                narc_roles[narc_path] = role
+
     else:  # gba/gbc/gb
+        # Load raw ROM binary into memory
+        with open(path, 'rb') as _f:
+            rom_data = bytearray(_f.read())
+
+        current_rom = {
+            'type': rom_type, 'path': path, 'header': header,
+            'data': rom_data,
+        }
+
         fpn_path = find_flipnote(gc)
         if not fpn_path:
             fpn_path = create_flipnote(
                 gc, header['game_title'], header['region'],
-                header['region_char'], [], {}, False
+                header['region_char'], [], {}, header.get('is_english', True)
             )
-        current_rom = {
-            'type': rom_type, 'path': path, 'header': header, 'data': None
-        }
+
+        # Bootstrap text tables by scanning the binary
+        try:
+            text_table_result = bootstrap_text_tables_binary(
+                bytes(rom_data), rom_type, header.get('region', 'US')
+            )
+        except Exception as e:
+            text_table_result = {"error": str(e), "gen": 0}
+
+        # Discover data table offsets from the ROM itself (no hardcoding)
+        if rom_type == 'gba':
+            gen3_offsets = _discover_gen3_tables()
+            if gen3_offsets:
+                text_table_result["gen3_tables"] = f"personal@0x{gen3_offsets.get('personal_base',0):X} move@0x{gen3_offsets.get('move_base',0):X}"
 
     with open(fpn_path, 'r', encoding='utf-8') as f:
         current_flipnote = {'path': str(fpn_path), 'data': json.load(f)}
@@ -4057,13 +4545,16 @@ async def spotlight(path: str) -> dict:
     except Exception:
         pass
 
-    # Build Eonet in background — capture gc now so the thread doesn't race on current_rom
-    if current_rom and current_rom['type'] == 'nds':
+    # Build Eonet in background for interactive spotlight calls only.
+    # During restore, _do_pending_restore runs BFS sequentially — skip here to avoid double-BFS race.
+    if current_rom and current_rom['type'] == 'nds' and not _rom_restore_in_progress:
         import asyncio as _asyncio
         _gc_capture = gc
-        _asyncio.ensure_future(
-            _asyncio.get_event_loop().run_in_executor(None, lambda: _build_eonet(_gc_capture))
-        )
+        try:
+            loop = _asyncio.get_running_loop()
+            loop.run_in_executor(None, lambda: _build_eonet(_gc_capture))
+        except RuntimeError:
+            _build_eonet(_gc_capture)
 
     # Build clean summary card
     game_info = GAME_INFO.get(gc, {})
@@ -4075,15 +4566,20 @@ async def spotlight(path: str) -> dict:
     tt = text_table_result
     if tt and tt.get("status") == "ok":
         detected = list(tt.get("detected", {}).keys())
-        lines.append(f"Text: Gen {tt['gen']} decoded — {tt['file_count']} files, tables: {', '.join(detected)}")
-        if tt.get("tm_table"): lines.append(f"TM/HM: {tt['tm_table']}")
+        if rom_type == 'nds':
+            lines.append(f"Text: Gen {tt['gen']} decoded — {tt['file_count']} files, tables: {', '.join(detected)}")
+            if tt.get("tm_table"): lines.append(f"TM/HM: {tt['tm_table']}")
+        else:
+            lines.append(f"Text: Gen {tt['gen']} decoded — {tt.get('candidates',0)} text blocks found, tables: {', '.join(detected)}")
     elif tt and tt.get("error"):
         lines.append(f"Text: ERROR — {tt['error']}")
     key_roles = ("trdata", "trpoke", "personal", "learnsets", "encounters", "items")
-    for role in key_roles:
-        if role in narcs: lines.append(f"  {role}: {narcs[role]}")
+    if rom_type == 'nds':
+        for role in key_roles:
+            if role in narcs: lines.append(f"  {role}: {narcs[role]}")
     lines.append(f"Flipnote: {fpn_path}")
     lines.append("ICR indexing in background...")
+    _user_active_gc = gc  # Track what the user last spotlighted — BFS must not change this
     return {"_card": True, "text": "\n".join(lines), "game_code": gc, "loaded": list(loaded_roms.keys())}
 
 
@@ -4229,8 +4725,48 @@ async def summarize(path: str = "/", expand_narcs: bool = False) -> dict:
 
 
 
+def _format_gen3_trainer(decoded: dict) -> str:
+    """Format decoded Gen III trainer dict as positional text (mirrors format_trainer)."""
+    sp_list  = text_tables.get('species', [])
+    mv_list  = text_tables.get('moves', [])
+    it_list  = text_tables.get('items', [])
+    cls_list = text_tables.get('trainer_classes', [])
+    cls_name = cls_list[decoded['trainer_class']] if decoded['trainer_class'] < len(cls_list) else ''
+    title = f"{cls_name} {decoded['name']}".strip()
+    if decoded.get('is_double'):
+        title += " (Double)"
+    lines = [title, "", "Team:"]
+    for m in decoded['party']:
+        sp = sp_list[m['species']] if m['species'] < len(sp_list) else f"#{m['species']}"
+        ln = f"{sp} (Lv. {m['level']})"
+        if m.get('item'):
+            it_id = m['item']
+            ln += f"  [{it_list[it_id] if it_id < len(it_list) else f'item#{it_id}'}]"
+        lines.append(ln)
+        # IVs: stored as raw difficulty byte, same formula as NDS
+        iv_raw = m.get('iv', 0)
+        iv_val = iv_raw * 31 // 255 if iv_raw else 0
+        if iv_val:
+            lines.append(f"  IVs: {iv_val}/{iv_val}/{iv_val}/{iv_val}/{iv_val}/{iv_val}")
+        if m.get('moves'):
+            lines.append("  " + " / ".join(mv_list[mv-1] if 0 < mv <= len(mv_list) else f"move#{mv}" for mv in m['moves']))
+    # Footer
+    footer = []
+    battle_items = decoded.get('battle_items', [])
+    if battle_items:
+        names = [it_list[i] if i < len(it_list) else f"item#{i}" for i in battle_items]
+        footer.append(f"Items: {', '.join(names)}")
+    ai = decoded.get('ai_flags', 0)
+    if ai:
+        footer.append("AI: " + ", ".join(decode_ai_flags(ai, gen=4)))
+    if footer:
+        lines.append(" | ".join(footer))
+    return "\n".join(lines)
+
+
 async def decipher(path: str, offset: int = 0, length: int = None, decompress: bool = True) -> dict:
     """Read and decode files. Auto-decompresses and auto-decodes known structures (trainers, pokemon, encounters, etc.)."""
+    global _user_active_gc
     # Multi-file: comma-separated paths
     if "," in path:
         results = []
@@ -4243,17 +4779,27 @@ async def decipher(path: str, offset: int = 0, length: int = None, decompress: b
     if not current_rom:
         return {"error": "No ROM currently open"}
 
-    # Cross-ROM prefix: "IRE:a/0/1/6:1" routes to that ROM's data
+    # Ensure globals match the user's active ROM — BFS threads may have switched current_rom
+    _gc = _user_active_gc or (current_rom['header']['game_code'] if current_rom else None)
+    if _gc and _gc in loaded_roms and current_rom['header']['game_code'] != _gc:
+        _restore_state(_gc)
+
+    # Cross-ROM prefix: "IRE:a/0/1/6:1" or "BPRE:trainer:BROCK"
     gc_prefix, clean_path = _parse_rom_prefix(path)
     if gc_prefix and gc_prefix != current_rom['header']['game_code']:
+        if gc_prefix not in loaded_roms:
+            return {"error": f"ROM {gc_prefix} not loaded. Use spotlight() to load it first."}
         orig_gc = _switch_rom(gc_prefix)
+        orig_user_gc = _user_active_gc
+        _user_active_gc = gc_prefix
         try:
             result = await decipher(clean_path, offset, length, decompress)
         finally:
             _switch_rom(orig_gc)
+            _user_active_gc = orig_user_gc
         return result
     elif gc_prefix:
-        path = clean_path  # Same ROM, just strip prefix
+        path = clean_path
 
     if current_rom['type'] == 'nds':
         rom = current_rom['rom']
@@ -4315,6 +4861,12 @@ async def decipher(path: str, offset: int = 0, length: int = None, decompress: b
         except Exception as e:
             return {"error": str(e)}
 
+    elif current_rom['type'] in ('gba', 'gb', 'gbc'):
+        decoded = _auto_decode(path, b'')
+        if isinstance(decoded, str):
+            return {"_card": True, "path": path, "text": decoded,
+                    "game_code": current_rom['header']['game_code']}
+        return decoded
     else:
         with open(current_rom['path'], 'rb') as f:
             f.seek(offset)
@@ -4700,22 +5252,62 @@ async def dowse(narc_path: str = None, hex: str = None, name: str = None, table:
                 else:
                     if query in entry.lower():
                         results.append({"table": tbl_name, "index": idx, "name": entry})
-            # Auto-resolve trainer_classes hits → trdata files via class ID byte
-            class_hits = [r for r in results if r.get('table') == 'trainer_classes']
-            if class_hits and current_rom:
-                try:
-                    gc = current_rom.get('header', {}).get('game_code', '')
-                    trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
-                    if trdata_path:
-                        td_files = _get_narc(trdata_path).files
-                        for ch in class_hits:
-                            cid = ch['index']
-                            for fi, td in enumerate(td_files):
-                                if len(td) >= 2 and td[1] == cid:
-                                    results.append({'table': 'trdata', 'index': fi, 'name': ch['name']})
-                except Exception:
-                    pass
+        # Auto-resolve trainer_classes hits → trdata files via class ID byte
+        class_hits = [r for r in results if r.get('table') == 'trainer_classes']
+        if class_hits and current_rom:
+            try:
+                gc = current_rom.get('header', {}).get('game_code', '')
+                trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
+                if trdata_path:
+                    td_files = _get_narc(trdata_path).files
+                    for ch in class_hits:
+                        cid = ch['index']
+                        for fi, td in enumerate(td_files):
+                            if len(td) >= 2 and td[1] == cid:
+                                results.append({'table': 'trdata', 'index': fi, 'name': ch['name']})
+            except Exception:
+                pass
+        # trainer_names hits → trdata path (same index for NDS; name-based for GBA)
+        name_hits = [r for r in results if r.get('table') == 'trainer_names']
+        if name_hits and current_rom:
+            gc = current_rom.get('header', {}).get('game_code', '')
+            trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
+            for nh in name_hits:
+                if trdata_path:
+                    nh.setdefault('paths', []).append(f"{trdata_path}:{nh['index']:03d}")
+                elif current_rom.get('type') in ('gba', 'gb', 'gbc'):
+                    nh.setdefault('paths', []).append(f"{gc}:trainer:{nh['name']}")
+
         if not narc_path:
+            # Enrich text table hits with NARC paths from eonet_index (NDS only)
+            if results and current_rom and current_rom['type'] == 'nds':
+                gc = current_rom['header']['game_code']
+                idx = eonet_index.get(gc, [])
+                for r in results:
+                    name_lower = r['name'].lower()
+                    paths = []
+                    for entry in idx:
+                        # Match if entry name contains this name (e.g., "Patrat, Tackle (Learnsets)" contains "patrat")
+                        if name_lower in entry.get('name', ''):
+                            p = entry.get('path', '')
+                            desc = entry.get('desc', '')
+                            if p and p not in [x.split(' ')[0] for x in paths]:
+                                paths.append(f"{p} ({desc})" if desc else p)
+                    if paths:
+                        r['paths'] = paths[:8]  # Cap at 8 to avoid noise
+                # Reverse index enrichment: show every NARC/file where this value appears
+                from eonet_driver import _reverse_index
+                rev = _reverse_index.get(gc, {})
+                if rev:
+                    for r in results:
+                        val = r.get('index')
+                        if val is not None and val in rev:
+                            locs = rev[val]
+                            # Group by NARC path for readability
+                            by_narc = {}
+                            for narc_p, fi, off, tname in locs:
+                                by_narc.setdefault(narc_p, []).append(fi)
+                            r['found_in'] = {np: sorted(set(fis)) for np, fis in by_narc.items()}
             # Role/category search: if no text table hits, check narc_roles and eonet_labels
             if not results and current_rom:
                 gc = current_rom['header']['game_code']
@@ -4737,45 +5329,47 @@ async def dowse(narc_path: str = None, hex: str = None, name: str = None, table:
                     return {"query": name, "category_matches": role_hits, "count": len(role_hits)}
             result = {"query": name, "exact": exact, "matches": results, "count": len(results)}
 
-            # Difficulty filtering for Gen V BW2 (Challenge/Easy/Normal modes).
-            # Groups trdata matches into clusters (consecutive file indices = same difficulty block),
-            # then labels them by pokemon count: fewest = Easy, most = Challenge, middle = Normal.
-            # No hardcoded file ranges -- derived from the data itself.
-            if difficulty and gen == 5 and results:
-                trdata_hits = [r for r in results if r.get('table') == 'trdata']
-                other_hits  = [r for r in results if r.get('table') != 'trdata']
-                if trdata_hits:
-                    # Group by cluster: new cluster when gap > 20 file indices
-                    trdata_hits.sort(key=lambda r: r['index'])
-                    clusters = []
-                    cur = [trdata_hits[0]]
-                    for r in trdata_hits[1:]:
-                        if r['index'] - cur[-1]['index'] <= 20:
-                            cur.append(r)
-                        else:
-                            clusters.append(cur)
-                            cur = [r]
-                    clusters.append(cur)
-                    # Get median npoke per cluster by probing trdata
+            # Chain traversal: when there's a clear match, show the relational graph
+            # This follows foreign key chains through the ROM — like a SQL JOIN
+            if results and len(results) <= 3:
+                gc = current_rom['header']['game_code'] if current_rom else ''
+                for r in results:
                     try:
-                        gc = current_rom.get('header', {}).get('game_code', '')
-                        trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
-                        def _cluster_npoke(cluster):
-                            files = _get_narc(trdata_path).files
-                            counts = [files[r['index']][3] for r in cluster if r['index'] < len(files) and len(files[r['index']]) >= 4]
-                            return sum(counts) / max(len(counts), 1)
-                        scored = sorted(clusters, key=_cluster_npoke)
-                        # scored[0]=fewest pokemon=Easy, scored[-1]=most=Challenge, middle=Normal
-                        label_map = {'easy': 0, 'normal': len(scored)//2, 'challenge': -1}
-                        pick = label_map.get(difficulty.lower())
-                        if pick is not None:
-                            chosen = scored[pick]
-                            results = other_hits + chosen
-                            result['matches'] = results
-                            result['count'] = len(results)
-                            result['difficulty'] = difficulty.lower()
+                        chain = resolve_chain(gc, r['index'], r['table'], depth=1)
+                        if chain and 'error' not in chain:
+                            # Summarize: which NARCs reference this entity and what's alongside it
+                            summary = {}
+                            for narc_p, info in chain.get('by_narc', {}).items():
+                                role = info.get('role', '?')
+                                files = info.get('files', [])
+                                summary[f"{narc_p} ({role})"] = {
+                                    'files': files[:10],
+                                    'file_count': len(files),
+                                }
+                            if summary:
+                                r['chain'] = summary
                     except Exception:
                         pass
+
+            # Difficulty filtering for B2W2: file 764 is the Challenge Mode boundary.
+            # Files 0–763 = Normal Mode, 764–813 = Challenge Mode with different rosters.
+            # Easy Mode has no separate files — runtime level scaling on Normal data.
+            _BW2_CHALLENGE_START = 764
+            if difficulty and gen == 5 and results:
+                gc = current_rom.get('header', {}).get('game_code', '') if current_rom else ''
+                if gc in ('IRE', 'IRD'):  # B2W2 only
+                    diff = difficulty.lower()
+                    trdata_hits = [r for r in results if r.get('table') == 'trdata']
+                    other_hits = [r for r in results if r.get('table') != 'trdata']
+                    if trdata_hits and diff in ('normal', 'challenge'):
+                        if diff == 'normal':
+                            filtered = [r for r in trdata_hits if r['index'] < _BW2_CHALLENGE_START]
+                        else:
+                            filtered = [r for r in trdata_hits if r['index'] >= _BW2_CHALLENGE_START]
+                        results = other_hits + filtered
+                        result['matches'] = results
+                        result['count'] = len(results)
+                        result['difficulty'] = diff
 
             # Canonical rival name lookup -- fires whenever a search matches a known
             # rival by their English default name, regardless of hit count.
@@ -4988,7 +5582,7 @@ async def judgement(path_a: str, path_b: str) -> dict:
 
 
 
-async def stats() -> dict:
+async def stats(**_) -> dict:
     """Coverage: how much of the ROM the server can decode and has indexed."""
     if not current_rom:
         # Still show server status even without a ROM
@@ -5012,7 +5606,13 @@ async def stats() -> dict:
             eonet_status["error"] = "could not check"
         return {
             "status": "no ROM loaded",
-            "loaded_roms": list(loaded_roms.keys()),
+            "loaded_roms": {
+                gc: {
+                    "title": state['current_rom']['header'].get('game_title', '?'),
+                    "path": state['current_rom']['header'].get('rom_path', '?'),
+                }
+                for gc, state in loaded_roms.items()
+            },
             "eonet": eonet_status,
         }
     gc = current_rom['header']['game_code']
@@ -5073,7 +5673,15 @@ async def stats() -> dict:
     return {
         "game": current_rom['header']['game_title'],
         "rom_size": f"{total_bytes / 1024 / 1024:.1f} MB" if total_bytes else "?",
-        "loaded_roms": list(loaded_roms.keys()),
+        "startup_log": _startup_log if _startup_log else ["clean start"],
+        "text_tables_detected": [k for k in text_tables if isinstance(k, str) and isinstance(text_tables.get(k), list)],
+        "loaded_roms": {
+            gc: {
+                "title": state['current_rom']['header'].get('game_title', '?'),
+                "path": state['current_rom']['header'].get('rom_path', '?'),
+            }
+            for gc, state in loaded_roms.items()
+        },
         "icr": {
             "narcs_indexed": indexed_narcs,
             "files_indexed": indexed_files,
@@ -5088,7 +5696,7 @@ async def stats() -> dict:
 
 # ============ Flipnote Tools ============
 
-async def list_flipnotes() -> dict:
+async def list_flipnotes(**_) -> dict:
     """List all known game Flipnotes."""
     ensure_dirs()
 
@@ -5421,9 +6029,12 @@ async def probe(path: str, offset: int = 0, reads: str = "u16", count: int = 1,
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
     """Route tool calls to handler functions."""
-    # Lazy restore: load ROMs from last session on first tool call
+    # Wait for background restore if still running, or trigger if it never started
     if not _rom_restore_done:
-        await _do_pending_restore()
+        if _restore_task is not None:
+            await _restore_task
+        else:
+            await _do_pending_restore()
     handlers = {
         "spotlight": spotlight,
         "return": return_tool,
@@ -5452,7 +6063,11 @@ async def call_tool(name: str, arguments: dict):
 
     # When decipher returns decoded strings, frame with ═══ bars
     if name == 'decipher' and isinstance(result, dict):
-        game_title = current_rom['header']['game_title'] if current_rom else ''
+        if current_rom:
+            gc = current_rom['header']['game_code']
+            game_title = GAME_INFO.get(gc, {}).get('title') or current_rom['header']['game_title']
+        else:
+            game_title = ''
         bar = '═' * 39
 
         def _difficulty_label(path_str):
@@ -5475,14 +6090,21 @@ async def call_tool(name: str, arguments: dict):
                 # BW1 has no difficulty modes at all
                 if gc in ('IRB', 'IRA'):
                     return ''
+                # Only apply to trainer NARCs — not personal, learnsets, etc.
+                trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata', '')
+                trpoke_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trpoke', '')
+                path_narc = path_str.rsplit(':', 1)[0] if ':' in path_str else path_str
+                if path_narc not in (trdata_path, trpoke_path):
+                    return ''
                 import re as _re
                 m = _re.search(r':(\d+)$', path_str)
                 if not m:
                     return ''
                 file_idx = int(m.group(1))
 
-                # Hardcoded labels for trainers whose file sets span >2 clusters.
-                # E4/Champion have 4 files each: Normal, Challenge, Normal Rematch, Challenge Rematch.
+                # Hardcoded labels for E4/Champion — they have 4 variants each
+                # (Pre/Post × Normal/Challenge) so the boundary alone can't
+                # distinguish pre vs post.
                 BW2_EXPLICIT_LABELS = {
                     38:'Normal Mode | Pre-Champion',   143:'Challenge Mode | Pre-Champion',
                     772:'Normal Mode | Post-Champion', 777:'Challenge Mode | Post-Champion',
@@ -5498,51 +6120,31 @@ async def call_tool(name: str, arguments: dict):
                 if file_idx in BW2_EXPLICIT_LABELS:
                     return BW2_EXPLICIT_LABELS[file_idx]
 
-                trdata_path = GAME_INFO.get(gc, {}).get('narcs', {}).get('trdata')
-                if not trdata_path:
-                    return ''
-                td_files = _get_narc(trdata_path).files
-                if file_idx >= len(td_files) or len(td_files[file_idx]) < 2:
-                    return ''
-                this_class = td_files[file_idx][1]
-                # Collect all files with the same trainer class, cluster by proximity
-                same_class = [(i, td_files[i][3]) for i in range(len(td_files))
-                              if len(td_files[i]) >= 4 and td_files[i][1] == this_class]
-                if len(same_class) < 2:
-                    return ''
-                same_class.sort()
-                clusters, cur = [], [same_class[0]]
-                for item in same_class[1:]:
-                    if item[0] - cur[-1][0] <= 20:
-                        cur.append(item)
-                    else:
-                        clusters.append(cur)
-                        cur = [item]
-                clusters.append(cur)
-                # Only label when exactly 2 clusters exist (Normal + Challenge).
-                # 3+ clusters = Memory Link / rematch tiers / starter variants -- ambiguous, skip.
-                if len(clusters) != 2:
-                    return ''
-                # Sort by avg npoke: lower = Normal, higher = Challenge
-                # Easy Mode has no separate block (runtime level scaling only)
-                def avg_npoke(cl): return sum(x[1] for x in cl) / len(cl)
-                scored = sorted(clusters, key=avg_npoke)
-                labels = ['Normal Mode', 'Challenge Mode']
-                for rank, cl in enumerate(scored):
-                    if any(x[0] == file_idx for x in cl):
-                        return labels[rank]
+                # Simple boundary: 764+ = Challenge Mode, below = Normal Mode
+                _BW2_CHALLENGE_START = 764
+                if file_idx >= _BW2_CHALLENGE_START:
+                    return 'Challenge Mode'
+                # Only label Normal if a Challenge counterpart exists
+                # (offset 608 = distance between Normal and Challenge blocks)
+                if file_idx + 608 < 814:
+                    return 'Normal Mode'
             except Exception:
                 pass
             return ''
 
-        def _frame(decoded_str, path_str):
+        def _frame(decoded_str, path_str, gc=None):
             """Wrap decoded text in ═══ frame with game title and path."""
             lines = decoded_str.split('\n', 1)
             title = lines[0]
             body = lines[1] if len(lines) > 1 else ''
             diff = _difficulty_label(path_str)
             diff_tag = f' [{diff}]' if diff else ''
-            header = f"{bar}\n{title}{diff_tag}\n{game_title} | {path_str}\n{bar}"
+            gt = game_title
+            if gc and gc != (current_rom['header']['game_code'] if current_rom else None):
+                rom_state = loaded_roms.get(gc, {}).get('current_rom')
+                if rom_state:
+                    gt = rom_state['header'].get('game_title', gc)
+            header = f"{bar}\n{title}{diff_tag}\n{gt} | {path_str}\n{bar}"
             if body:
                 return f"{header}\n\n{body}\n{bar}"
             return f"{header}\n{bar}"
@@ -5556,7 +6158,9 @@ async def call_tool(name: str, arguments: dict):
                     continue
                 decoded = sub.get('decoded')
                 path_str = sub.get('path', '')
-                if isinstance(decoded, str):
+                if sub.get('_card') and isinstance(sub.get('text'), str):
+                    blocks.append(TextContent(type="text", text=_frame(sub['text'], path_str, sub.get('game_code'))))
+                elif isinstance(decoded, str):
                     blocks.append(TextContent(type="text", text=_frame(decoded, path_str)))
                 else:
                     summary = {"path": path_str, "size": sub.get("size", "?")}
@@ -5761,6 +6365,11 @@ if __name__ == "__main__":
         async with stdio_server() as (read_stream, write_stream):
             setup_tools()
             ensure_dirs()
+            
+            # Restore ROMs in background — don't block MCP handshake
+            global _restore_task
+            _restore_task = asyncio.create_task(_do_pending_restore())
+            
             # Recover notes from past conversations on startup
             try:
                 recovered = recover_notes_from_logs()
@@ -5772,6 +6381,14 @@ if __name__ == "__main__":
                     return eonet_resolve(params.get("message", ""), params.get("game_code"))
             except Exception:
                 pass
-            await server.run(read_stream, write_stream, server.create_initialization_options())
+            
+            # Try to wrap read stream with Eonet interception for IDE support
+            # If it fails, fall back to raw stream
+            try:
+                from eonet_driver import _EonetInterceptStream
+                intercepted_read = _EonetInterceptStream(read_stream)
+                await server.run(intercepted_read, write_stream, server.create_initialization_options())
+            except Exception:
+                await server.run(read_stream, write_stream, server.create_initialization_options())
 
     asyncio.run(main())

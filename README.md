@@ -2,110 +2,88 @@
 
 *Link Cable + Download Play*
 
-An MCP server that lets Claude open Nintendo ROMs like folders.
+An MCP server that lets AI explore, decode, and modify Nintendo ROMs as navigable filesystems.
 
 ---
 
-## The Idea
+## What It Does
 
-DS ROMs aren't mysterious binary blobs. They're filesystems. The Nitro File System gives them actual folders, actual files, actual structure. Tools like Tinke have known this for years.
+DS ROMs aren't mysterious binary blobs — they're filesystems. The Nitro File System gives them folders, files, and structure. Tools like Tinke have known this for years. LinkPlay brings that to AI.
 
-But Claude couldn't see it. Until now.
+Open a ROM. Browse its file tree. Read encounter tables, trainer teams, and base stats. Decode text — species names, move names, location names. Write changes back. Save a modified ROM. Come back later and remember what you found.
 
-LinkPlay treats `.nds` files the way they deserve to be treated: as archives you can browse, explore, and understand. Open a ROM. See its structure. Read the files inside. Learn what each NARC contains. Write that knowledge down. Come back later and remember.
+For GB/GBA/GBC — no filesystem there, just bytes. LinkPlay handles that too.
 
-For GB/GBA/GBC—no filesystem there, just bytes. LinkPlay handles that too. Different paradigm, same interface.
+## Supported Games
 
-## Why This Matters
+| Generation | Games | Text Decryption | Auto-Decode |
+|------------|-------|-----------------|-------------|
+| **Gen IV** | Diamond, Pearl, Platinum, HeartGold, SoulSilver | ✅ Gen IV XOR + F100 9-bit | ✅ Full |
+| **Gen V** | Black, White, Black 2, White 2 | ✅ Gen V XOR + ROL3 | ✅ Full |
+| **GBA/GB/GBC** | Any ROM | — | Hex only |
 
-ROM documentation is fragmented. Scattered across dead forums, wrong wikis, and outdated tools. Gen V data gets confused with Gen IV. Obscure games have almost nothing.
+## What You Can Decode
 
-What if Claude could explore ROMs directly? Document what it finds? Build up knowledge over time?
-
-That's LinkPlay.
-
-## Text Tables (Gen V)
-
-When opening a Gen V ROM (Black, White, Black 2, White 2), LinkPlay decodes the entire text NARC (a/0/0/2) — all 495 files — into memory. Species names, move names, item names, trainer names, ability names, everything. This makes `read` able to show you "Pikachu" instead of "0x1900" when reading trainer data. The text decryption uses a per-entry XOR key derived from the species file.
-
-## Flipnotes
-
-When Claude opens a game for the first time, LinkPlay creates a Flipnote—a `.fpn` file that stores:
-
-- The complete file structure (auto-generated, immutable)
-- Notes Claude adds about what each path contains (editable, persistent)
-
-Open Pokemon Black 2. Claude explores `a/0/9/1`, figures out it's trainer data, notes it. Close. Come back a week later. That knowledge is still there.
-
-Flipnotes are identified by game code but named by title. `Pokémon_Black_2.fpn` is human-readable. The game code inside (`IRE`) is what actually links it to any Black 2 ROM, regardless of filename.
-
-Share Flipnotes. Correct bad documentation. Build institutional memory for ROM research.
+- **Base stats** — HP/Atk/Def/SpA/SpD/Spe, types, abilities, catch rate, EV yield, TM/HM compatibility
+- **Learnsets** — level-up moves for every Pokémon
+- **Evolutions** — 30 evolution methods, targets, parameters
+- **Move data** — power, accuracy, PP, type, category, priority, multi-hit, effect chance
+- **Trainer teams** — species, level, IVs, moves, held items, AI flags
+- **Wild encounters** — species, levels, rates by terrain/time-of-day, with correct location names
+- **Battle facilities** — Battle Tower, Battle Subway, PWT pools and rosters
+- **Item data** — prices, fling power
+- **Pokéathlon stats** — HGSS performance data
+- **Contest data** — DPPt contest Pokémon
+- **All text** — species, moves, items, abilities, natures, types, trainer names/classes, location names
 
 ## Tools
 
-**ROM Operations:**
-- `open_rom` / `close_rom` — load ROM, bootstrap text tables, clean up
-- `ls` / `read` / `write` — navigate and modify (read auto-decodes known structures)
-- `save_rom` — repack with changes
-- `hexdump` — raw bytes when you need them
-- `search` — find text by name, hex patterns in NARCs, or cross-reference both
-- `diff` — compare files byte-by-byte
+| Tool | Server Name | What It Does |
+|------|-------------|--------------|
+| Open ROM | `spotlight` | Load ROM, bootstrap text tables, create flipnote |
+| Close ROM | `return` | Clear state, optionally save |
+| Browse | `summarize` | List folder or NARC contents |
+| Read | `decipher` | Read + auto-decode known structures |
+| Write | `sketch` | Write hex/text data to files |
+| Save | `record` | Repack ROM with modifications |
+| Hex Dump | `scope` | Raw bytes with search and XOR |
+| Search | `dowse` | Find text by name, hex patterns in NARCs |
+| Compare | `judgement` | Byte-level diff, supports cross-ROM |
+| Stats | `stats` | Documentation coverage report |
+| Note | `note` | Add knowledge to current flipnote |
+| Batch Notes | `batch_notes` | Write multiple notes at once |
+| Edit Note | `edit_note` | Modify existing note |
+| Delete Note | `delete_note` | Remove a note |
+| List Flipnotes | `list_flipnotes` | See all known games |
+| View Flipnote | `view_flipnote` | Read a game's notes |
 
-**Analysis:**
-- `stats` — documentation coverage report
+See `tools.md` for full parameter specs.
 
-**Flipnote Operations:**
-- `list_flipnotes` / `view_flipnote` — see what Claude knows
-- `note` / `edit_note` / `delete_note` — document discoveries
+## Flipnotes
 
-See `tools.md` for full specifications.
+Persistent `.fpn` files that store what you learn about a ROM across sessions. Open HeartGold, document that `a/1/3/6` contains encounters. Close. Come back a week later. That knowledge is still there.
 
-## Dependencies
+Paired games share flipnotes — Diamond & Pearl, HeartGold & SoulSilver, Black & White, Black 2 & White 2.
 
-**Python packages** (auto-installed by `uv`):
-- `mcp` — Model Context Protocol
-- `ndspy` — DS ROM/NARC handling, LZ10 fallback
+## Eonet (Optional)
 
-**Compression tools** (auto-downloaded on first run):
-LinkPlay automatically downloads CUE's DS/GBA Compressors (GPL licensed):
+The Eonet system (`eonet_driver.py`) is an optional client-side orchestrator that sits between the user and Claude. It uses iterative cross-referencing (ICR) to automatically discover what each NARC file contains by matching binary content against decoded text tables. When a user asks "What's Iris's team?", Eonet resolves `a/0/9/1:47` and `a/0/9/2:47` before Claude even sees the message.
 
-| Tool | Format | Header | Usage |
-|------|--------|--------|-------|
-| `blz` | BLZ | (tail) | ARM9/overlays |
-| `lzss` | LZ10 | `0x10` | Standard DS/GBA |
-| `lzx` | LZ11/LZ40 | `0x11`, `0x40` | Newer DS games |
-| `huffman` | Huffman | `0x20`, `0x28` | Various |
-| `rle` | RLE | `0x30` | Various |
-
-The download uses Selenium with undetected-chromedriver to bypass Cloudflare on romhacking.net. If the RAR already exists in your Downloads folder, it skips the browser entirely.
-
-Compression is completely transparent - Claude works with decompressed data, and LinkPlay automatically recompresses on save/close.
-
-**Supported platforms:**
-- Nintendo DS (.nds) - Full filesystem support
-- Game Boy Advance (.gba) - Byte-level access
-- Game Boy Color (.gbc) - Byte-level access
-- Game Boy (.gb) - Byte-level access
+See `docs/EONET.md` for details.
 
 ## Setup
 
-### 1. Install uv (Python package manager)
+### 1. Install uv
 
 ```bash
 pip install uv
 ```
 
-Or download from: https://docs.astral.sh/uv/
+### 2. Configure Your MCP Client
 
-### 2. Configure Claude Desktop
+Add to your MCP config (Claude Desktop, Antigravity, etc.):
 
-Edit your Claude Desktop config:
-
-**Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Linux:** `~/.config/Claude/claude_desktop_config.json`
-
-Add:
+**Standard (no Eonet):**
 ```json
 {
   "mcpServers": {
@@ -123,19 +101,65 @@ Add:
 }
 ```
 
-Replace the path with your actual LinkPlay directory path.
+**With Eonet (automatic routing):**
+```json
+{
+  "mcpServers": {
+    "linkplay": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/LinkPlay",
+        "run",
+        "python",
+        "eonet_driver.py",
+        "--proxy"
+      ]
+    }
+  }
+}
+```
 
-### 3. Restart Claude Desktop
+Replace the path with your actual LinkPlay directory. See `mcp_config.example.json` for full config with comments.
 
-That's it! `uv` automatically installs dependencies and manages the environment. Compression tools are downloaded on first use.
+### 3. Restart Your Client
+
+`uv` automatically installs dependencies and manages the environment. Compression tools are downloaded on first use.
 
 See `INSTALL.md` for detailed setup and troubleshooting.
 
+## In Practice
+
+Open HeartGold. Ask for Route 43's encounters. Get back:
+
+```
+Route 43
+Grass (Default):
+  FLAAFFY             Lv. 15-17   40% (Day) / 30% (Morning, Night)
+  GIRAFARIG           Lv. 15      30%
+  PIDGEOTTO           Lv. 17      25% (Morning) / 20% (Day)
+  ...
+```
+
+Open Black 2. Read Iris's champion team. Get species, levels, IVs, moves, held items, AI flags. Search for every trainer using Garchomp. Compare Garchomp's base stats between HeartGold and Black 2 with both ROMs open at once.
+
+Document what you find. Come back a week later. It's all still there.
+
+## Dependencies
+
+**Python packages** (auto-installed by `uv`):
+- `mcp` — Model Context Protocol
+- `ndspy` — DS ROM/NARC handling
+- `aiohttp` — HTTP proxy for Eonet
+- `cryptography` — TLS cert generation for Eonet
+- `curl-cffi` — Cloudflare bypass for tool downloads
+
+**Compression tools** (auto-downloaded on first run):
+CUE's DS/GBA Compressors — blz, lzss, lzx, huffman, rle
+
 ## Status
 
-Works. Tested against Pokemon Black 2, White 2, and Black. Has decoded trainer data, wild encounters, PWT tournament pools, and ARM9 patches. Text decryption verified against all 495 Gen V text files.
-
-What's missing will become obvious when people actually use it.
+Tested against all 9 Gen IV/V Pokémon DS games. Decodes trainers, encounters, base stats, learnsets, evolutions, moves, items, battle facilities, and all text. Location name resolution verified for DP, Pt, HGSS, BW, and B2W2.
 
 ---
 
