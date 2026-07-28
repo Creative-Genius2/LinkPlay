@@ -50,6 +50,9 @@ The same tools work whether you're reading Cheren's team in Black 2, Brock's par
 | Hex Dump | `scope` | Raw bytes with search and XOR |
 | Search | `dowse` | Name → decipher-ready paths across all tables; hex pattern scan |
 | Compare | `judgement` | Byte-level diff, supports cross-ROM |
+| Binary Read | `probe` | Structured read at offset — u8/u16/u32, auto-annotates |
+| Sprites | `sprite_convert` | Extract NDS sprites; PNG→NDS conversion (Gen IV) |
+| Append | `narc_append` | Add new files to a NARC (HGSS+) |
 | Stats | `stats` | Documentation coverage report |
 | Note | `note` | Add knowledge to current flipnote |
 | Batch Notes | `batch_notes` | Write multiple notes at once |
@@ -121,7 +124,7 @@ Add to your MCP config (Claude Desktop, Antigravity, etc.):
 }
 ```
 
-Replace the path with your actual LinkPlay directory. See `mcp_config.example.json` for full config with comments.
+Replace the path with your actual LinkPlay directory. See `our_mcp_config.json` for a working example.
 
 ### 3. Restart Your Client
 
