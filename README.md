@@ -51,10 +51,10 @@ The same tools work whether you're reading Cheren's team in Black 2, Brock's par
 | Searching | `dowse` | Name → decipher-ready paths across all tables; hex pattern scan |
 | Diffing | `judgement` | Byte-level diff, supports cross-ROM |
 | Binary Struct Reads | `probe` | Structured read at offset — u8/u16/u32, auto-annotates |
-| Sprite Creation | `sprite_convert` | Extract NDS sprites; PNG→NDS conversion (Gen IV) |
+| Sprite Creation | `sprite_convert` | Extract NDS sprites; PNG→NDS conversion (Gen IV, Gen V in dev) |
 | Appending files to existing NARC folders | `narc_append` | Add new files to a NARC (HGSS+) |
 | Stats | `stats` | Documentation coverage report |
-| Flipnote notation (consists of the next 6 tools) | `note` | Add knowledge to current flipnote |
+| Flipnote notation (consists of the next 5 tools) | `note` | Add knowledge to current flipnote |
 | Batch Notes | `batch_notes` | Write multiple notes at once |
 | Edit Note | `edit_note` | Modify existing note |
 | Delete Note | `delete_note` | Remove a note |
@@ -156,6 +156,8 @@ Document what you find. Come back a week later. It's all still there.
 - `ndspy` — DS ROM/NARC handling
 - `aiohttp` — HTTP proxy for Eonet
 - `cryptography` — TLS cert generation for Eonet
+- `Pillow` — PNG sprite conversion
+- `spacy` — NLP for Eonet resolution
 - `curl-cffi` — Cloudflare bypass for tool downloads
 
 **Compression tools** (auto-downloaded on first run):
@@ -163,7 +165,7 @@ CUE's DS/GBA Compressors — blz, lzss, lzx, huffman, rle
 
 ## Status
 
-Tested against all 9 Gen IV/V Pokémon DS games. Decodes trainers, encounters, base stats, learnsets, evolutions, moves, items, battle facilities, and all text. Location name resolution verified for DP, Pt, HGSS, BW, and B2W2.
+Tested against 14 Pokémon ROMs — Gen I through Gen V, GB through DS. Decodes trainers, encounters, base stats, learnsets, evolutions, moves, items, battle facilities, and all text. Location name resolution verified for DP, Pt, HGSS, BW, and B2W2.
 
 ---
 
