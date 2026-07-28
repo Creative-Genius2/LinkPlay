@@ -1,0 +1,24 @@
+# Everything excluded by default — whitelist what we want
+*
+
+# Core server
+!scripts/
+!scripts/server.py
+!scripts/setup_tools.py
+!Generations/
+!Generations/*.py
+!eonet_driver.py
+!eonet_launcher.py
+
+# Docs + config
+!README.md
+!INSTALL.md
+!SKILL.md
+!tools.md
+!our_mcp_config.json
+!requirements.txt
+!LICENSE
+!Iterative_Cross_Referencing 2.docx
+!docs/
+!docs/*.md
+!.gitignore
