@@ -9,6 +9,7 @@
 !Generations/*.py
 !eonet_driver.py
 !eonet_launcher.py
+!xoleon.py
 
 # Docs + config
 !README.md

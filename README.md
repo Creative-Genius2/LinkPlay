@@ -17,7 +17,7 @@ The same tools work whether you're reading Cheren's team in Black 2, Brock's par
 | Generation | Games | Text Decryption | Auto-Decode |
 |------------|-------|-----------------|-------------|
 | **Gen V** | Black, White, Black 2, White 2 | ✅ Gen V XOR + ROL3 | ✅ Full |
-| **Gen IV** | Diamond, Pearl, Platinum, HeartGold, SoulSilver | ✅ Gen IV XOR + F100 9-bit | ✅ Full |
+| **Gen IV** | Diamond, Pearl, Platinum, HeartGold, SoulSilver | ✅ Gen IV XOR + 0xF100-flagged 9-bit packing | ✅ Full |
 | **Gen III (GBA)** | FireRed, LeafGreen, Ruby, Sapphire, Emerald | ✅ EN charmap | ✅ Trainers, personal, moves, learnsets |
 | **Gen I JP (GB)** | Red JP, Green JP, Blue JP, Yellow JP | ✅ JP charmap (disassembly-verified) | ✅ Personal, trainers, species, moves |
 | **Gen I EN (GB)** | Red EN, Blue EN, Yellow EN | ✅ EN charmap | ⚠️ Partial — species/moves only |
