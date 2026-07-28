@@ -21,7 +21,7 @@ The same tools work whether you're reading Cheren's team in Black 2, Brock's par
 | **Gen III (GBA)** | FireRed, LeafGreen, Ruby, Sapphire, Emerald | ✅ EN charmap | ✅ Trainers, personal, moves, learnsets |
 | **Gen I JP (GB)** | Red JP, Green JP, Blue JP, Yellow JP | ✅ JP charmap (disassembly-verified) | ✅ Personal, trainers, species, moves |
 | **Gen I EN (GB)** | Red EN, Blue EN, Yellow EN | ✅ EN charmap | ⚠️ Partial — species/moves only |
-| **Gen II (GBC)** | Gold, Silver, Crystal | 🔴 Not yet started | 🔴 Hex only |
+| **Gen II (GBC)** | Gold, Silver, Crystal | ✅ EN charmap | ⚠️ Partial — trainers, encounters |
 
 ## What You Can Decode
 
@@ -48,7 +48,7 @@ The same tools work whether you're reading Cheren's team in Black 2, Brock's par
 | Write | `sketch` | Write hex/text data to files |
 | Save | `record` | Repack ROM with modifications |
 | Hex Dump | `scope` | Raw bytes with search and XOR |
-| Search | `dowse` | Find text by name, hex patterns in NARCs |
+| Search | `dowse` | Name → decipher-ready paths across all tables; hex pattern scan |
 | Compare | `judgement` | Byte-level diff, supports cross-ROM |
 | Stats | `stats` | Documentation coverage report |
 | Note | `note` | Add knowledge to current flipnote |
@@ -70,7 +70,7 @@ Paired games share flipnotes — Diamond & Pearl, HeartGold & SoulSilver, Black 
 
 The Eonet system (`eonet_driver.py`) is an optional client-side orchestrator that sits between the user and Claude. It uses iterative cross-referencing (ICR) to automatically discover what each NARC file contains by matching binary content against decoded text tables. When a user asks "What's Iris's team?", Eonet resolves `a/0/9/1:47` and `a/0/9/2:47` before Claude even sees the message.
 
-See `docs/EONET.md` for details.
+See `docs/ICR.md` for the underlying pattern.
 
 ## Setup
 
