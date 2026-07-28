@@ -43,18 +43,18 @@ The same tools work whether you're reading Cheren's team in Black 2, Brock's par
 |------|-------------|--------------|
 | Open ROM | `spotlight` | Load ROM, bootstrap text tables, create flipnote |
 | Close ROM | `return` | Clear state, optionally save |
-| Browse | `summarize` | List folder or NARC contents |
-| Read | `decipher` | Read + auto-decode known structures |
+| ROM browsing (without reading) | `summarize` | List folder or NARC contents |
+| Reading files in the rom | `decipher` | Read + auto-decode known structures |
 | Write | `sketch` | Write hex/text data to files |
 | Save | `record` | Repack ROM with modifications |
 | Hex Dump | `scope` | Raw bytes with search and XOR |
-| Search | `dowse` | Name → decipher-ready paths across all tables; hex pattern scan |
-| Compare | `judgement` | Byte-level diff, supports cross-ROM |
-| Binary Read | `probe` | Structured read at offset — u8/u16/u32, auto-annotates |
-| Sprites | `sprite_convert` | Extract NDS sprites; PNG→NDS conversion (Gen IV) |
-| Append | `narc_append` | Add new files to a NARC (HGSS+) |
+| Searching | `dowse` | Name → decipher-ready paths across all tables; hex pattern scan |
+| Diffing | `judgement` | Byte-level diff, supports cross-ROM |
+| Binary Struct Reads | `probe` | Structured read at offset — u8/u16/u32, auto-annotates |
+| Sprite Creation | `sprite_convert` | Extract NDS sprites; PNG→NDS conversion (Gen IV) |
+| Appending files to existing NARC folders | `narc_append` | Add new files to a NARC (HGSS+) |
 | Stats | `stats` | Documentation coverage report |
-| Note | `note` | Add knowledge to current flipnote |
+| Flipnote notation (consists of the next 6 tools) | `note` | Add knowledge to current flipnote |
 | Batch Notes | `batch_notes` | Write multiple notes at once |
 | Edit Note | `edit_note` | Modify existing note |
 | Delete Note | `delete_note` | Remove a note |
