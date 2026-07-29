@@ -82,6 +82,7 @@ from Generations.gen4_dppt_hgss import (
     POKEATHLON_STATS, _build_pokeathlon_form_map, _POKEATHLON_FORM_MAP,
     decode_pokeathlon_performance,
 )
+from Generations.gen7_sm_usum import _GEN7_USUM, _GEN7_SM
 from Generations.gen5_bw import (
     _GEN5_CHARMAP, _derive_gen5_mult, decode_gen5_text,
     _GEN5_B2W2, _GEN5_BW1,
@@ -96,6 +97,9 @@ from Generations.gen5_bw import (
     decode_pwt_trainer_config, _scan_pwt_tournaments,
     _resolve_pwt_text, decode_pwt_tournament_def,
     pwt_name_to_entries, pwt_entry_tournaments,
+)
+from xoleon import (
+    read_3ds_header, open_3ds_romfs, read_garc_sub, read_garc_all,
 )
 
 
@@ -558,6 +562,8 @@ def detect_rom_type(path: str) -> str:
     ext = Path(path).suffix.lower()
     if ext == '.nds':
         return 'nds'
+    elif ext == '.3ds':
+        return '3ds'
     elif ext == '.gba':
         return 'gba'
     elif ext == '.gbc':
@@ -939,9 +945,41 @@ def _is_overlay_path(path: str) -> int:
 
 
 def _resolve_nds_file(path: str) -> bytes:
-    """Resolve an NDS file path to raw bytes. Raises ValueError on error."""
+    """Resolve an NDS/3DS file path to raw bytes. Raises ValueError on error."""
     p = path.strip('/')
     pl = p.lower()
+
+    # 3DS: read from open RomFS via xoleon
+    if current_rom.get('type') == '3ds':
+        fh, fs = current_rom['romfs_fh'], current_rom['romfs_files']
+        if ':' in p:
+            gp, fi = p.rsplit(':', 1)
+            gp = gp.lstrip('/')
+            if gp not in fs:
+                raise ValueError(f"GARC not found: {gp}")
+            fi = int(fi)
+            # WD flat files: single GARC sub-file packing multiple entries (move_data)
+            wd = current_rom.get('wd_cache', {}).get(gp)
+            if wd is None:
+                data, total = read_garc_sub(fh, fs[gp][0], 0)
+                if data and len(data) > 4 and data[0:2] == b'WD':
+                    count = struct.unpack_from('<H', data, 2)[0]
+                    offsets = [struct.unpack_from('<I', data, 4 + i*4)[0] for i in range(count + 1)]
+                    wd = [data[offsets[i]:offsets[i+1]] for i in range(count)]
+                    current_rom.setdefault('wd_cache', {})[gp] = wd
+            if wd is not None:
+                if fi >= len(wd):
+                    raise ValueError(f"Index {fi} out of range (WD has {len(wd)} entries)")
+                return wd[fi]
+            data, total = read_garc_sub(fh, fs[gp][0], fi)
+            if data is None:
+                raise ValueError(f"Index {fi} out of range (GARC has {total} files)")
+            return data
+        if p not in fs:
+            raise ValueError(f"File not found in RomFS: {p}")
+        off, sz = fs[p]
+        fh.seek(off)
+        return fh.read(sz)
     if pl == 'arm9.bin':
         return bytes(current_rom['arm9_data'])
     if pl == 'arm7.bin':
@@ -1255,7 +1293,21 @@ def bootstrap_text_tables_binary(rom_data: bytes, rom_type: str,
 # Game info — gen + NARC role mappings. Roles auto-drive _auto_decode.
 # Gen IV — DP/Pt use named folders, HGSS uses a/X/Y/Z
 
+_GEN6_ORAS = {
+    'text': 'a/0/3/2',  # same text path as Gen VII — TBD: verify personal
+}
+
 GAME_INFO = {
+    # Gen VII — Nintendo 3DS
+    'A2B': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2017, 'title': 'Pokemon Ultra Moon', 'narcs': {**_GEN7_USUM}},    # Ultra Moon
+    'A2A': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2017, 'title': 'Pokemon Ultra Sun', 'narcs': {**_GEN7_USUM}},     # Ultra Sun
+    '1Q2': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2016, 'title': 'Pokemon Moon', 'narcs': {**_GEN7_SM}},            # Moon
+    '1Q1': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2016, 'title': 'Pokemon Sun', 'narcs': {**_GEN7_SM}},             # Sun
+    # Gen VI — Nintendo 3DS
+    'ECR': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2014, 'title': 'Pokemon Omega Ruby', 'narcs': {**_GEN6_ORAS}},    # Omega Ruby
+    'ECL': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2014, 'title': 'Pokemon Alpha Sapphire', 'narcs': {**_GEN6_ORAS}},# Alpha Sapphire
+    'EKJ': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2013, 'title': 'Pokemon X', 'narcs': {**_GEN6_ORAS}},             # X (TBD: verify)
+    'EK2': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2013, 'title': 'Pokemon Y', 'narcs': {**_GEN6_ORAS}},             # Y (TBD: verify)
     # Gen V — Nintendo DS
     'IRE': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2012, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # Black 2 US
     'IRD': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2012, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # White 2 US
@@ -1704,8 +1756,10 @@ def get_text(key, entry_index: int = None):
     return strings[entry_index] if entry_index < len(strings) else f"#{entry_index}"
 
 
-def bootstrap_text_tables(rom, game_code: str) -> dict:
-    """Load text NARC, decode all files, auto-detect named tables. Returns summary."""
+def bootstrap_text_tables(rom, game_code: str, file_list: list = None) -> dict:
+    """Load text NARC/GARC, decode all files, auto-detect named tables.
+    If file_list is provided (3DS), skip NARC loading — files already extracted by xoleon.
+    """
     global text_tables, text_narc, text_mult, text_gen
     text_tables = {}
     text_narc = None
@@ -1731,15 +1785,29 @@ def bootstrap_text_tables(rom, game_code: str) -> dict:
         if role != 'text':
             narc_roles[path] = role
 
-    try:
-        narc_data = rom.getFileByName(text_narc_path)
-        text_narc = ndspy.narc.NARC(narc_data)
-    except Exception as e:
-        return {"error": f"Failed to load text NARC {text_narc_path}: {e}"}
+    if file_list is not None:
+        # 3DS: xoleon already read the GARC — wrap as narc-like object
+        class _GarcFiles:
+            pass
+        text_narc = _GarcFiles()
+        text_narc.files = file_list
+    else:
+        # NDS: load via ndspy
+        try:
+            narc_data = rom.getFileByName(text_narc_path)
+            text_narc = ndspy.narc.NARC(narc_data)
+        except Exception as e:
+            return {"error": f"Failed to load text NARC {text_narc_path}: {e}"}
 
     file_count = len(text_narc.files)
 
-    if gen == 5:
+    if gen in (6, 7):
+        # Gen VI/VII: same cipher as Gen V, MULT always 0x2983
+        text_mult = 0x2983
+        for i in range(file_count):
+            text_tables[i] = decode_gen5_text(text_narc.files[i], text_mult)
+
+    elif gen == 5:
         # Gen V: find species file to derive MULT, then decode all
         # Try common indices first, then brute-force
         candidates = [90, 70] + [i for i in range(file_count) if i not in (90, 70)]
@@ -3621,7 +3689,7 @@ def _auto_decode(path: str, data: bytes, _rom=None):
     if not role:
         return {"_unknown": True, "reason": f"no role for {narc_part}", "hint": f"scope({path}) or dowse(name='...', narc_path='{narc_part}')"}
 
-    rom = current_rom['rom']
+    rom = current_rom.get('rom')
 
     try:
         if role in ('trpoke', 'trdata'):
@@ -3807,6 +3875,8 @@ async def spotlight(path: str) -> dict:
     # Peek at header to check if already loaded
     if rom_type == 'nds':
         header = read_nds_header(path)
+    elif rom_type == '3ds':
+        header = read_3ds_header(path)
     elif rom_type in ('gba', 'gbc', 'gb'):
         header = read_gba_header(path) if rom_type == 'gba' else read_gb_header(path)
     else:
@@ -3949,6 +4019,38 @@ async def spotlight(path: str) -> dict:
         for role, narc_path in game_info.get('narcs', {}).items():
             if role != 'text' and narc_path not in narc_roles:
                 narc_roles[narc_path] = role
+
+    elif rom_type == '3ds':
+        fh, romfs_files = open_3ds_romfs(path)
+        current_rom = {
+            'type': '3ds', 'path': path, 'header': header,
+            'romfs_fh': fh, 'romfs_files': romfs_files,
+            'compression_state': {}
+        }
+
+        fpn_path = find_flipnote(gc)
+        if not fpn_path:
+            fpn_path = create_flipnote(
+                gc, (GAME_INFO.get(gc, {}).get('title') or header['game_title']).replace(' Nintendo','').replace(' Game Freak','').strip(),
+                header['region'], header['region_char'], [], {}, header.get('is_english', True)
+            )
+
+        game_info = GAME_INFO.get(gc, {})
+        text_gen = game_info.get('gen')
+        narcs = game_info.get('narcs', {})
+
+        # Bootstrap text: load GARC files via xoleon, feed into existing decoder
+        text_garc = narcs.get('text', '')
+        if text_garc and text_garc in romfs_files:
+            garc_files = read_garc_all(fh, romfs_files[text_garc][0])
+            try:
+                text_table_result = bootstrap_text_tables(None, gc, file_list=garc_files)
+            except Exception as e:
+                text_table_result = {"error": str(e)}
+
+        for role, np in narcs.items():
+            if role != 'text' and np not in narc_roles:
+                narc_roles[np] = role
 
     else:  # gba/gbc/gb
         tm_table.clear()  # GB/GBC/GBA has no ARM9 TM table — clear any stale NDS data
@@ -4359,7 +4461,7 @@ async def decipher(path: str, offset: int = 0, length: int = None, decompress: b
     elif gc_prefix:
         path = clean_path
 
-    if current_rom['type'] == 'nds':
+    if current_rom['type'] in ('nds', '3ds'):
         try:
             data = _resolve_nds_file(path)
             compression = 'none'
@@ -5130,7 +5232,7 @@ async def scope(path: str = None, offset: int = 0, length: int = 256, search: st
         elif gc_prefix:
             path = clean_path
 
-    if current_rom['type'] == 'nds' and path:
+    if current_rom['type'] in ('nds', '3ds') and path:
         try:
             data = _resolve_nds_file(path)
         except Exception as e:
@@ -5140,7 +5242,7 @@ async def scope(path: str = None, offset: int = 0, length: int = 256, search: st
             f.seek(offset)
             data = f.read(length + (1024 if search else 0))
 
-    dump_data = data[offset:offset + length] if current_rom['type'] == 'nds' and path else data[:length]
+    dump_data = data[offset:offset + length] if current_rom['type'] in ('nds', '3ds') and path else data[:length]
 
     # Apply XOR key if provided
     if xor:
@@ -5996,7 +6098,7 @@ async def probe(path: str, offset: int = 0, reads: str = "u16", count: int = 1,
     elif gc_prefix:
         path = clean_path
     try:
-        if current_rom['type'] != 'nds':
+        if current_rom['type'] not in ('nds', '3ds'):
             with open(current_rom['path'], 'rb') as f:
                 data = f.read()
         else:

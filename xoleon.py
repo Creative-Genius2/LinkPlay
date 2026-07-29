@@ -1,4 +1,4 @@
-"""xoleon — Gen IV/V Pokémon text decryption."""
+"""xoleon — Pokémon text decryption and ROM container readers (Gen IV–VII)."""
 import struct
 
 
@@ -104,7 +104,7 @@ def decode_gen5_text(data: bytes, mult: int = 0x2983) -> list:
             dec = vals[j]
             j += 1
 
-            if dec == 0xFFFF:
+            if dec == 0xFFFF or dec == 0x0000:
                 break
             elif dec == 0xFFFE:
                 ctrl_type = vals[j] if j < len(vals) else 0
@@ -324,3 +324,143 @@ def decode_gen4_text(data: bytes) -> list:
         strings.append(''.join(chars))
 
     return strings
+
+
+# ============ 3DS Container Reader ============
+
+def read_3ds_header(path: str) -> dict:
+    """Read game info from a .3ds ROM (NCCH header at partition 0).
+    3DS product codes (CTR-P-XXXX) don't encode region reliably —
+    region is inferred from filename if possible, else defaults to US.
+    """
+    with open(path, 'rb') as f:
+        NCCH = 0x4000
+        f.seek(NCCH + 0x100 + 0x50)
+        product_code = f.read(16).decode('ascii', errors='ignore').strip('\x00')
+        parts = product_code.split('-')
+        game_id = parts[-1] if parts else product_code
+        game_code = game_id[:3] if len(game_id) >= 3 else game_id
+
+        # Title from ExHeader (NCCH + 0x200) — usually JP codename
+        f.seek(NCCH + 0x200)
+        title = f.read(8).decode('ascii', errors='ignore').strip('\x00')
+
+    # Infer region from filename
+    fname = path.lower()
+    if '(usa)' in fname or '(us)' in fname:
+        region, region_char = 'US', 'E'
+    elif '(europe)' in fname or '(eu)' in fname:
+        region, region_char = 'EU', 'P'
+    elif '(japan)' in fname or '(jp)' in fname:
+        region, region_char = 'JP', 'J'
+    else:
+        region, region_char = 'US', 'E'
+
+    return {
+        'game_code': game_code,
+        'full_code': game_id,
+        'product_code': product_code,
+        'region_char': region_char,
+        'short_title': title,
+        'game_title': title,
+        'is_english': region != 'JP',
+        'region': region,
+    }
+
+
+def open_3ds_romfs(path: str):
+    """Open a .3ds ROM, parse RomFS filesystem.
+    Returns (file_handle, files_dict).
+    files_dict maps paths like 'a/0/3/2' to (absolute_offset, size).
+    Caller must close the file handle.
+    """
+    f = open(path, 'rb')
+    NCCH = 0x4000
+    f.seek(NCCH + 0x100 + 0xB0)
+    romfs_mu = struct.unpack('<I', f.read(4))[0]
+    romfs = NCCH + romfs_mu * 0x200
+    L3 = romfs + 0x1000
+    f.seek(L3)
+    h = f.read(0x30)
+    dmo = struct.unpack_from('<I', h, 12)[0]
+    dms = struct.unpack_from('<I', h, 16)[0]
+    fmo = struct.unpack_from('<I', h, 28)[0]
+    fms = struct.unpack_from('<I', h, 32)[0]
+    fdo = struct.unpack_from('<I', h, 36)[0]
+
+    # Parse directory metadata
+    f.seek(L3 + dmo)
+    dd = f.read(dms)
+    dirs = {}
+    p = 0
+    while p < len(dd):
+        par = struct.unpack_from('<I', dd, p)[0]
+        nl = struct.unpack_from('<I', dd, p + 20)[0]
+        nm = dd[p + 24:p + 24 + nl].decode('utf-16le') if nl else '(root)'
+        dirs[p] = (nm, par)
+        p += (24 + nl + 3) & ~3
+
+    def _dir_path(o):
+        r = []
+        while o in dirs:
+            n, pa = dirs[o]
+            r.append(n)
+            if pa == o:
+                break
+            o = pa
+        return '/'.join(reversed(r))
+
+    # Parse file metadata
+    f.seek(L3 + fmo)
+    fd = f.read(fms)
+    files = {}
+    p = 0
+    while p < len(fd):
+        par = struct.unpack_from('<I', fd, p)[0]
+        do = struct.unpack_from('<Q', fd, p + 8)[0]
+        ds = struct.unpack_from('<Q', fd, p + 16)[0]
+        nl = struct.unpack_from('<I', fd, p + 28)[0]
+        nm = fd[p + 32:p + 32 + nl].decode('utf-16le') if nl else ''
+        fpath = _dir_path(par).replace('(root)/', '') + '/' + nm
+        files[fpath] = (L3 + fdo + do, ds)
+        p += (32 + nl + 3) & ~3
+
+    return f, files
+
+
+def read_garc_sub(f, garc_abs: int, idx: int):
+    """Read sub-file idx from a GARC at absolute offset garc_abs.
+    Returns (bytes, total_count) or (None, total_count) if out of range.
+    """
+    f.seek(garc_abs)
+    h = f.read(0x24)
+    hs = struct.unpack_from('<I', h, 4)[0]
+    f.seek(garc_abs + hs)
+    fato = f.read(12)
+    fato_sz = struct.unpack_from('<I', fato, 4)[0]
+    fatb_abs = garc_abs + hs + fato_sz
+    f.seek(fatb_abs)
+    fatb = f.read(12)
+    fatb_sz = struct.unpack_from('<I', fatb, 4)[0]
+    fatb_n = struct.unpack_from('<I', fatb, 8)[0]
+    if idx >= fatb_n:
+        return None, fatb_n
+    f.seek(fatb_abs + 12 + idx * 16)
+    e = struct.unpack('<IIII', f.read(16))
+    s, en = e[1], e[2]
+    da = fatb_abs + fatb_sz
+    f.seek(da)
+    dh = f.read(12)
+    dhs = struct.unpack_from('<I', dh, 4)[0]
+    f.seek(da + dhs + s)
+    return f.read(en - s), fatb_n
+
+
+def read_garc_all(f, garc_abs: int) -> list:
+    """Read ALL sub-files from a GARC. Returns list of bytes."""
+    _, total = read_garc_sub(f, garc_abs, 0)
+    files = []
+    for i in range(total):
+        data, _ = read_garc_sub(f, garc_abs, i)
+        files.append(data if data else b'')
+    return files
