@@ -85,9 +85,9 @@ from Generations.gen4_dppt_hgss import (
     _GEN4_TRAINER_LOCATIONS, _GEN4_CLASS_LOCATIONS,
     _GEN4_TM_SEARCH, MOVE_CATEGORIES_G4,
 )
-from Generations.gen1_rb_y import _GEN1_FLIPNOTE_PAIRS, _GEN1_GAME_INFO, TABLE_FINGERPRINTS_JPN
-from Generations.gen2_gs_c import _GEN2_FLIPNOTE_PAIRS, _GEN2_GAME_INFO
-from Generations.gen3_rse_frlg import _GEN3_FLIPNOTE_PAIRS, _GEN3_GAME_INFO, TABLE_FINGERPRINTS_GEN3
+from Generations.gen1_rgby import _GEN1_FLIPNOTE_PAIRS, _GEN1_GAME_INFO, TABLE_FINGERPRINTS_JPN
+from Generations.gen2_gsc import _GEN2_FLIPNOTE_PAIRS, _GEN2_GAME_INFO
+from Generations.gen3_rse import _GEN3_FLIPNOTE_PAIRS, _GEN3_GAME_INFO, TABLE_FINGERPRINTS_GEN3
 from Generations.gen6_xy_oras import _GEN6_ORAS, _GEN6_FLIPNOTE_PAIRS, _GEN6_GAME_INFO
 from Generations.gen7_sm_usum import _GEN7_USUM, _GEN7_SM, _GEN7_FLIPNOTE_PAIRS, _GEN7_GAME_INFO
 from Generations.gen5_bw import (
