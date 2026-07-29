@@ -81,8 +81,15 @@ from Generations.gen4_dppt_hgss import (
     _decode_encounters_dpp, _decode_encounters_hgss,
     POKEATHLON_STATS, _build_pokeathlon_form_map, _POKEATHLON_FORM_MAP,
     decode_pokeathlon_performance,
+    _GEN4_FLIPNOTE_PAIRS, _GEN4_GAME_INFO,
+    _GEN4_TRAINER_LOCATIONS, _GEN4_CLASS_LOCATIONS,
+    _GEN4_TM_SEARCH, MOVE_CATEGORIES_G4,
 )
-from Generations.gen7_sm_usum import _GEN7_USUM, _GEN7_SM
+from Generations.gen1_rb_y import _GEN1_FLIPNOTE_PAIRS, _GEN1_GAME_INFO, TABLE_FINGERPRINTS_JPN
+from Generations.gen2_gs_c import _GEN2_FLIPNOTE_PAIRS, _GEN2_GAME_INFO
+from Generations.gen3_rse_frlg import _GEN3_FLIPNOTE_PAIRS, _GEN3_GAME_INFO, TABLE_FINGERPRINTS_GEN3
+from Generations.gen6_xy_oras import _GEN6_ORAS, _GEN6_FLIPNOTE_PAIRS, _GEN6_GAME_INFO
+from Generations.gen7_sm_usum import _GEN7_USUM, _GEN7_SM, _GEN7_FLIPNOTE_PAIRS, _GEN7_GAME_INFO
 from Generations.gen5_bw import (
     _GEN5_CHARMAP, _derive_gen5_mult, decode_gen5_text,
     _GEN5_B2W2, _GEN5_BW1,
@@ -97,6 +104,9 @@ from Generations.gen5_bw import (
     decode_pwt_trainer_config, _scan_pwt_tournaments,
     _resolve_pwt_text, decode_pwt_tournament_def,
     pwt_name_to_entries, pwt_entry_tournaments,
+    _GEN5_FLIPNOTE_PAIRS, _GEN5_GAME_INFO,
+    _GEN5_TRAINER_LOCATIONS, _GEN5_CLASS_LOCATIONS,
+    _GEN5_TM_SEARCH, MOVE_CATEGORIES_G5, _FORM_NAMES,
 )
 from xoleon import (
     read_3ds_header, open_3ds_romfs, read_garc_sub, read_garc_all,
@@ -671,29 +681,7 @@ def read_gb_header(path: str) -> dict:
 
 
 # Shared flipnotes — paired games share one flipnote
-FLIPNOTE_PAIRS = {
-    # Gen V
-    'Pokémon Black & White': ['IRB', 'IRA'],
-    'Pokémon Black & White 2': ['IRE', 'IRD'],
-    # Gen IV
-    'Pokémon Diamond & Pearl': ['ADA', 'APA'],
-    'Pokémon Platinum': ['CPU'],
-    'Pokémon HeartGold & SoulSilver': ['IPK', 'IPG'],
-    # Gen III (GBA)
-    'Pokémon FireRed & LeafGreen': ['BPRE', 'BPGE'],
-    'Pokémon Ruby & Sapphire': ['AXVE', 'AXPE'],
-    'Pokémon Emerald': ['BPEE'],
-    # Gen II (GBC)
-    'Pokémon Gold & Silver': ['PMG2', 'PMS'],
-    'Pokémon Crystal': ['PM_'],
-    # Gen I (GB) — US
-    'Pokémon Red & Blue': ['PMR', 'PMB'],
-    'Pokémon Yellow': ['PMY'],
-    # Gen I (GB) — JP
-    'Pocket Monsters Red & Green': ['PKMRJ', 'PMG'],
-    'Pocket Monsters Blue (JP)': ['PMBJP'],
-    'Pocket Monsters Yellow (JP)': ['PMYJ'],
-}
+FLIPNOTE_PAIRS = {**_GEN7_FLIPNOTE_PAIRS, **_GEN6_FLIPNOTE_PAIRS, **_GEN5_FLIPNOTE_PAIRS, **_GEN4_FLIPNOTE_PAIRS, **_GEN3_FLIPNOTE_PAIRS, **_GEN2_FLIPNOTE_PAIRS, **_GEN1_FLIPNOTE_PAIRS}
 
 def get_shared_name(game_code: str) -> Optional[str]:
     for name, codes in FLIPNOTE_PAIRS.items():
@@ -901,6 +889,43 @@ def build_nds_structure(rom, rom_path: str) -> tuple:
 
     if rom.filenames:
         walk_folder(rom.filenames)
+
+    return tree, rom_stats
+
+
+def build_3ds_structure(romfs_files: dict, fh, rom_path: str) -> tuple:
+    """Build flat tree and ROM stats from 3DS ROM's RomFS."""
+    tree = []
+    rom_stats = {
+        'total_bytes': Path(rom_path).stat().st_size,
+        'files': {},
+        'file_count': 0,
+        'garc_count': 0,
+        'total_garc_files': 0
+    }
+
+    # Group paths into folders and files
+    for fpath in sorted(romfs_files.keys()):
+        abs_off, size = romfs_files[fpath]
+        tree.append(fpath)
+        rom_stats['file_count'] += 1
+        file_info = {'size': size, 'type': 'file'}
+
+        # Check if it's a GARC
+        try:
+            data, _ = read_garc_sub(fh, abs_off, 0)
+            # If read_garc_sub succeeded, it's a GARC
+            garc_files = read_garc_all(fh, abs_off)
+            file_info['type'] = 'garc'
+            file_info['file_count'] = len(garc_files)
+            rom_stats['garc_count'] += 1
+            rom_stats['total_garc_files'] += len(garc_files)
+            for idx in range(len(garc_files)):
+                tree.append(f"{fpath}:{idx}")
+        except Exception:
+            pass
+
+        rom_stats['files'][fpath] = file_info
 
     return tree, rom_stats
 
@@ -1293,52 +1318,8 @@ def bootstrap_text_tables_binary(rom_data: bytes, rom_type: str,
 # Game info — gen + NARC role mappings. Roles auto-drive _auto_decode.
 # Gen IV — DP/Pt use named folders, HGSS uses a/X/Y/Z
 
-_GEN6_ORAS = {
-    'text': 'a/0/3/2',  # same text path as Gen VII — TBD: verify personal
-}
 
-GAME_INFO = {
-    # Gen VII — Nintendo 3DS
-    'A2B': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2017, 'title': 'Pokemon Ultra Moon', 'narcs': {**_GEN7_USUM}},    # Ultra Moon
-    'A2A': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2017, 'title': 'Pokemon Ultra Sun', 'narcs': {**_GEN7_USUM}},     # Ultra Sun
-    '1Q2': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2016, 'title': 'Pokemon Moon', 'narcs': {**_GEN7_SM}},            # Moon
-    '1Q1': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2016, 'title': 'Pokemon Sun', 'narcs': {**_GEN7_SM}},             # Sun
-    # Gen VI — Nintendo 3DS
-    'ECR': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2014, 'title': 'Pokemon Omega Ruby', 'narcs': {**_GEN6_ORAS}},    # Omega Ruby
-    'ECL': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2014, 'title': 'Pokemon Alpha Sapphire', 'narcs': {**_GEN6_ORAS}},# Alpha Sapphire
-    'EKJ': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2013, 'title': 'Pokemon X', 'narcs': {**_GEN6_ORAS}},             # X (TBD: verify)
-    'EK2': {'gen': 6, 'platform': 'Nintendo 3DS', 'year': 2013, 'title': 'Pokemon Y', 'narcs': {**_GEN6_ORAS}},             # Y (TBD: verify)
-    # Gen V — Nintendo DS
-    'IRE': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2012, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # Black 2 US
-    'IRD': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2012, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # White 2 US
-    'IRB': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2011, 'narcs': {**_GEN5_BW1, **_BW1_ENCOUNTERS, **_BW1_SUBWAY}},                  # Black US
-    'IRA': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2011, 'narcs': {**_GEN5_BW1, **_BW1_ENCOUNTERS, **_BW1_SUBWAY}},                  # White US
-    # Gen IV — Nintendo DS
-    'ADA': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2007, 'narcs': {**_GEN4_DP_COMMON, 'encounters': 'fielddata/encountdata/d_enc_data.narc'}},  # Diamond US
-    'APA': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2007, 'narcs': {**_GEN4_DP_COMMON, 'encounters': 'fielddata/encountdata/p_enc_data.narc'}},  # Pearl US
-    'CPU': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2009, 'narcs': {**_GEN4_COMMON, **_GEN4_PLATINUM_OVERRIDES}},                      # Platinum US
-    'IPK': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2010, 'narcs': {**_GEN4_HGSS}},                                                    # HeartGold US
-    'IPG': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2010, 'narcs': {**_GEN4_HGSS}},                                                    # SoulSilver US
-    # Gen III — Game Boy Advance
-    'BPRE': {'gen': 3, 'platform': 'Game Boy Advance', 'year': 2004, 'title': 'POKÉMON FIRERED'},
-    'BPGE': {'gen': 3, 'platform': 'Game Boy Advance', 'year': 2004, 'title': 'POKÉMON LEAFGREEN'},
-    'AXVE': {'gen': 3, 'platform': 'Game Boy Advance', 'year': 2003, 'title': 'POKÉMON RUBY'},
-    'AXPE': {'gen': 3, 'platform': 'Game Boy Advance', 'year': 2003, 'title': 'POKÉMON SAPPHIRE'},
-    'BPEE': {'gen': 3, 'platform': 'Game Boy Advance', 'year': 2005, 'title': 'POKÉMON EMERALD'},
-    # Gen II — Game Boy Color
-    'PMG2': {'gen': 2, 'platform': 'Game Boy Color', 'year': 2000, 'title': 'POKÉMON GOLD'},
-    'PMS':  {'gen': 2, 'platform': 'Game Boy Color', 'year': 2000, 'title': 'POKÉMON SILVER'},
-    'PM_':  {'gen': 2, 'platform': 'Game Boy Color', 'year': 2001, 'title': 'POKÉMON CRYSTAL'},
-    # Gen I — Game Boy (EN)
-    'PMR':  {'gen': 1, 'platform': 'Game Boy', 'year': 1998, 'title': 'POKÉMON RED'},
-    'PMB':  {'gen': 1, 'platform': 'Game Boy', 'year': 1998, 'title': 'POKÉMON BLUE'},
-    'PMY':  {'gen': 1, 'platform': 'Game Boy', 'year': 1999, 'title': 'POKÉMON YELLOW'},
-    # Gen I — Game Boy (JP)
-    'PMG':    {'gen': 1, 'platform': 'Game Boy', 'year': 1996, 'title': 'POCKET MONSTERS GREEN',  'jp': True},
-    'PKMRJ':  {'gen': 1, 'platform': 'Game Boy', 'year': 1996, 'title': 'POCKET MONSTERS RED',    'jp': True},
-    'PMBJP':  {'gen': 1, 'platform': 'Game Boy', 'year': 1996, 'title': 'POCKET MONSTERS BLUE',   'jp': True},
-    'PMYJ':   {'gen': 1, 'platform': 'Game Boy', 'year': 1998, 'title': 'POCKET MONSTERS YELLOW', 'jp': True},
-}
+GAME_INFO = {**_GEN7_GAME_INFO, **_GEN6_GAME_INFO, **_GEN5_GAME_INFO, **_GEN4_GAME_INFO, **_GEN3_GAME_INFO, **_GEN2_GAME_INFO, **_GEN1_GAME_INFO}
 
 # Content fingerprints — universal across all Pokemon games.
 # (entry_index, expected_string) pairs that ALL must match.
@@ -1355,21 +1336,9 @@ TABLE_FINGERPRINTS = {
 # Gen III fingerprints — move/item tables start at index 0, not 1.
 # Species still starts at 1 (index 0 = dummy). Moves/items have no dummy.
 # Items are 44-byte structs — scanned separately, not as raw strings.
-TABLE_FINGERPRINTS_GEN3 = {
-    'moves':      [(0, "Pound"), (4, "Mega Punch")],
-    'items':      [(0, "Master Ball"), (3, "Poké Ball"), (12, "Potion")],
-    'type_names': [(0, "NORMAL"), (1, "FIGHT"), (2, "FLYING")],  # Gen III uses abbreviated display names
-}
 
 # Japanese content fingerprints — same indices, Japanese text.
 # Verified from Bulbapedia: はたく=Pound, メガトンパンチ=Mega Punch, etc.
-TABLE_FINGERPRINTS_JPN = {
-    'species':    [(1, "フシギダネ"), (4, "ヒトカゲ")],
-    'moves':      [(0, "はたく"), (4, "メガトンパンチ")],  # JP Gen I: Pound at index 0 (no dummy)
-    'items':      [(1, "マスターボール")],
-    'natures':    [(0, "がんばりや"), (1, "さみしがり"), (3, "いじっぱり")],
-    'type_names': [(0, "ノーマル")],
-}
 
 # Heuristic markers — tables without unique index-based fingerprints.
 # All listed strings must appear SOMEWHERE in the file.
@@ -1547,159 +1516,10 @@ def decode_ai_flags(flags: int, gen: int = 5) -> list:
 # Maps special trainers (Gym Leaders, E4, Champions) to their battle locations.
 # =============================================================================
 
-TRAINER_LOCATIONS = {
-    # Gen IV - Diamond/Pearl
-    "ADA": {
-        ("Leader", "Roark"): "Oreburgh Gym",
-        ("Leader", "Gardenia"): "Eterna Gym",
-        ("Leader", "Maylene"): "Veilstone Gym",
-        ("Leader", "Crasher Wake"): "Pastoria Gym",
-        ("Leader", "Wake"): "Pastoria Gym",
-        ("Leader", "Fantina"): "Hearthome Gym",
-        ("Leader", "Byron"): "Canalave Gym",
-        ("Leader", "Candice"): "Snowpoint Gym",
-        ("Leader", "Volkner"): "Sunyshore Gym",
-        ("Elite Four", "Aaron"): "Pokémon League",
-        ("Elite Four", "Bertha"): "Pokémon League",
-        ("Elite Four", "Flint"): "Pokémon League",
-        ("Elite Four", "Lucian"): "Pokémon League",
-        ("Champion", "Cynthia"): "Pokémon League",
-    },
-    "APA": "ADA",  # Pearl alias
-    
-    # Gen IV - Platinum
-    "CPU": {
-        ("Leader", "Roark"): "Oreburgh Gym",
-        ("Leader", "Gardenia"): "Eterna Gym",
-        ("Leader", "Fantina"): "Hearthome Gym",
-        ("Leader", "Maylene"): "Veilstone Gym",
-        ("Leader", "Crasher Wake"): "Pastoria Gym",
-        ("Leader", "Wake"): "Pastoria Gym",
-        ("Leader", "Byron"): "Canalave Gym",
-        ("Leader", "Candice"): "Snowpoint Gym",
-        ("Leader", "Volkner"): "Sunyshore Gym",
-        ("Elite Four", "Aaron"): "Pokémon League",
-        ("Elite Four", "Bertha"): "Pokémon League",
-        ("Elite Four", "Flint"): "Pokémon League",
-        ("Elite Four", "Lucian"): "Pokémon League",
-        ("Champion", "Cynthia"): "Pokémon League",
-        ("Tower Tycoon", "Palmer"): "Battle Tower",
-    },
-    
-    # Gen IV - HeartGold/SoulSilver
-    "IPK": {
-        # Johto Gym Leaders
-        ("Leader", "Falkner"): "Violet Gym",
-        ("Leader", "Bugsy"): "Azalea Gym",
-        ("Leader", "Whitney"): "Goldenrod Gym",
-        ("Leader", "Morty"): "Ecruteak Gym",
-        ("Leader", "Chuck"): "Cianwood Gym",
-        ("Leader", "Jasmine"): "Olivine Gym",
-        ("Leader", "Pryce"): "Mahogany Gym",
-        ("Leader", "Clair"): "Blackthorn Gym",
-        # Kanto Gym Leaders (class = name in HGSS)
-        ("Leader", "Brock"): "Pewter Gym",
-        ("Leader", "Misty"): "Cerulean Gym",
-        ("Leader", "Lt. Surge"): "Vermilion Gym",
-        ("Leader", "Erika"): "Celadon Gym",
-        ("Leader", "Janine"): "Fuchsia Gym",
-        ("Leader", "Sabrina"): "Saffron Gym",
-        ("Leader", "Blaine"): "Seafoam Gym",
-        ("Leader", "Blue"): "Viridian Gym",
-        # Elite Four & Champion
-        ("Elite Four", "Will"): "Indigo Plateau",
-        ("Elite Four", "Koga"): "Indigo Plateau",
-        ("Elite Four", "Bruno"): "Indigo Plateau",
-        ("Elite Four", "Karen"): "Indigo Plateau",
-        ("Champion", "Lance"): "Indigo Plateau",
-        # Special
-        ("PKMN Trainer", "Red"): "Mt. Silver (Summit)",
-    },
-    "IPG": "IPK",  # SoulSilver alias
-    
-    # Gen V - Black/White
-    "IRB": {
-        ("Leader", "Cilan"): "Striaton Gym",
-        ("Leader", "Chili"): "Striaton Gym",
-        ("Leader", "Cress"): "Striaton Gym",
-        ("Leader", "Lenora"): "Nacrene Gym",
-        ("Leader", "Burgh"): "Castelia Gym",
-        ("Leader", "Elesa"): "Nimbasa Gym",
-        ("Leader", "Clay"): "Driftveil Gym",
-        ("Leader", "Skyla"): "Mistralton Gym",
-        ("Leader", "Brycen"): "Icirrus Gym",
-        ("Leader", "Drayden"): "Opelucid Gym",
-        ("Leader", "Iris"): "Opelucid Gym",
-        ("Elite Four", "Shauntal"): "Pokémon League",
-        ("Elite Four", "Grimsley"): "Pokémon League",
-        ("Elite Four", "Caitlin"): "Pokémon League",
-        ("Elite Four", "Marshal"): "Pokémon League",
-        ("Champion", "Alder"): "Pokémon League",
-        ("PKMN Trainer", "N"): "N's Castle",
-        ("Subway Boss", "Ingo"): "Battle Subway",
-        ("Subway Boss", "Emmet"): "Battle Subway",
-    },
-    "IRA": "IRB",  # White alias
-    
-    # Gen V - Black 2/White 2
-    "IRE": {
-        ("Leader", "Cheren"): "Aspertia Gym",
-        ("Leader", "Roxie"): "Virbank Gym",
-        ("Leader", "Burgh"): "Castelia Gym",
-        ("Leader", "Elesa"): "Nimbasa Gym",
-        ("Leader", "Clay"): "Driftveil Gym",
-        ("Leader", "Skyla"): "Mistralton Gym",
-        ("Leader", "Drayden"): "Opelucid Gym",
-        ("Leader", "Marlon"): "Humilau Gym",
-        ("Elite Four", "Shauntal"): "Pokémon League",
-        ("Elite Four", "Grimsley"): "Pokémon League",
-        ("Elite Four", "Caitlin"): "Pokémon League",
-        ("Elite Four", "Marshal"): "Pokémon League",
-        ("Champion", "Iris"): "Pokémon League",
-        ("Subway Boss", "Ingo"): "Battle Subway",
-        ("Subway Boss", "Emmet"): "Battle Subway",
-    },
-    "IRD": "IRE",  # White 2 alias
-}
+TRAINER_LOCATIONS = {**_GEN4_TRAINER_LOCATIONS, **_GEN5_TRAINER_LOCATIONS}
 
 # Class-only location mappings (fallback when name not found)
-CLASS_LOCATIONS = {
-    "ADA": {"Elite Four": "Pokémon League", "Champion": "Pokémon League"},
-    "APA": "ADA",
-    "CPU": {"Elite Four": "Pokémon League", "Champion": "Pokémon League", "Tower Tycoon": "Battle Tower"},
-    "IPK": {"Elite Four": "Indigo Plateau", "Champion": "Indigo Plateau",
-            "Brock": "Pewter Gym", "Misty": "Cerulean Gym", "Lt. Surge": "Vermilion Gym",
-            "Erika": "Celadon Gym", "Janine": "Fuchsia Gym", "Sabrina": "Saffron Gym",
-            "Blaine": "Seafoam Gym", "Blue": "Viridian Gym"},
-    "IPG": "IPK",
-    "IRB": {"Elite Four": "Pokémon League", "Champion": "Pokémon League", "Subway Boss": "Battle Subway"},
-    "IRA": "IRB",
-    "IRE": {
-        "Elite Four": "Pokémon League", "Champion": "Pokémon League", "Subway Boss": "Battle Subway",
-        # PWT participants (class = name)
-        "Brock": "Pokémon World Tournament", "Misty": "Pokémon World Tournament",
-        "Lt. Surge": "Pokémon World Tournament", "Erika": "Pokémon World Tournament",
-        "Sabrina": "Pokémon World Tournament", "Blaine": "Pokémon World Tournament",
-        "Giovanni": "Pokémon World Tournament", "Falkner": "Pokémon World Tournament",
-        "Bugsy": "Pokémon World Tournament", "Whitney": "Pokémon World Tournament",
-        "Morty": "Pokémon World Tournament", "Chuck": "Pokémon World Tournament",
-        "Jasmine": "Pokémon World Tournament", "Pryce": "Pokémon World Tournament",
-        "Clair": "Pokémon World Tournament", "Janine": "Pokémon World Tournament",
-        "Roxanne": "Pokémon World Tournament", "Brawly": "Pokémon World Tournament",
-        "Wattson": "Pokémon World Tournament", "Flannery": "Pokémon World Tournament",
-        "Norman": "Pokémon World Tournament", "Winona": "Pokémon World Tournament",
-        "Tate": "Pokémon World Tournament", "Liza": "Pokémon World Tournament",
-        "Juan": "Pokémon World Tournament", "Roark": "Pokémon World Tournament",
-        "Gardenia": "Pokémon World Tournament", "Fantina": "Pokémon World Tournament",
-        "Maylene": "Pokémon World Tournament", "Wake": "Pokémon World Tournament",
-        "Byron": "Pokémon World Tournament", "Candice": "Pokémon World Tournament",
-        "Volkner": "Pokémon World Tournament", "Blue": "Pokémon World Tournament",
-        "Lance": "Pokémon World Tournament", "Steven": "Pokémon World Tournament",
-        "Wallace": "Pokémon World Tournament", "Red": "Pokémon World Tournament",
-        "Cynthia": "Pokémon World Tournament", "Alder": "Pokémon World Tournament",
-    },
-    "IRD": "IRE",
-}
+CLASS_LOCATIONS = {**_GEN4_CLASS_LOCATIONS, **_GEN5_CLASS_LOCATIONS}
 
 
 def get_trainer_location(game_code: str, class_name: str, trainer_name: str):
@@ -1862,10 +1682,7 @@ def bootstrap_text_tables(rom, game_code: str, file_list: list = None) -> dict:
 # TM table search patterns: first 4 TM move IDs as u16 LE
 # Gen V: TM01=Hone Claws(468), TM02=Dragon Claw(337), TM03=Psyshock(473), TM04=Calm Mind(347)
 # Gen IV: TM01=Focus Punch(264), TM02=Dragon Claw(337), TM03=Water Pulse(352), TM04=Calm Mind(347)
-_TM_SEARCH = {
-    5: (bytes([0xD4, 0x01, 0x51, 0x01, 0xD9, 0x01, 0x5B, 0x01]), 101),  # 95 TMs + 6 HMs
-    4: (bytes([0x08, 0x01, 0x51, 0x01, 0x60, 0x01, 0x5B, 0x01]), 100),  # 92 TMs + 8 HMs
-}
+_TM_SEARCH = {**_GEN4_TM_SEARCH, **_GEN5_TM_SEARCH}
 
 
 def _discover_tm_table():
@@ -2513,8 +2330,6 @@ def decode_evolution(data: bytes, file_idx: int = 0):
     return "\n".join(lines)
 
 
-MOVE_CATEGORIES_G5 = {0: "Status", 1: "Physical", 2: "Special"}
-MOVE_CATEGORIES_G4 = {0: "Physical", 1: "Special", 2: "Status"}
 
 def decode_move_data(data: bytes, file_idx: int = 0):
     """Decode move data. Format detected by size — no gen check needed.
@@ -2591,26 +2406,6 @@ def decode_encounters(data: bytes) -> dict:
 
 # (species_id, form_idx) -> parenthetical label appended to species name in encounter display
 # Form 0 entries are included when the base form has a meaningful name (e.g. Basculin Red-Striped)
-_FORM_NAMES = {
-    (351, 1): "Sunny", (351, 2): "Rainy", (351, 3): "Snowy",
-    (386, 1): "Attack", (386, 2): "Defense", (386, 3): "Speed",
-    (412, 0): "Plant", (412, 1): "Sandy", (412, 2): "Trash",
-    (413, 0): "Plant", (413, 1): "Sandy", (413, 2): "Trash",
-    (421, 1): "Sunshine",
-    (422, 0): "West", (422, 1): "East",
-    (423, 0): "West", (423, 1): "East",
-    (479, 1): "Heat", (479, 2): "Wash", (479, 3): "Frost", (479, 4): "Fan", (479, 5): "Mow",
-    (487, 1): "Origin",
-    (492, 1): "Sky",
-    (550, 0): "Red-Striped", (550, 1): "Blue-Striped",
-    (555, 0): "Standard", (555, 1): "Zen Mode",
-    (585, 0): "Spring", (585, 1): "Summer", (585, 2): "Autumn", (585, 3): "Winter",
-    (586, 0): "Spring", (586, 1): "Summer", (586, 2): "Autumn", (586, 3): "Winter",
-    (641, 1): "Therian", (642, 1): "Therian", (645, 1): "Therian",
-    (646, 1): "White", (646, 2): "Black",
-    (647, 1): "Resolute",
-    (648, 1): "Pirouette",
-}
 
 
 
@@ -4029,10 +3824,13 @@ async def spotlight(path: str) -> dict:
         }
 
         fpn_path = find_flipnote(gc)
-        if not fpn_path:
+        if fpn_path:
+            fpn_path = upgrade_to_shared_flipnote(gc)
+        else:
+            structure, rom_stats = build_3ds_structure(romfs_files, fh, path)
             fpn_path = create_flipnote(
                 gc, (GAME_INFO.get(gc, {}).get('title') or header['game_title']).replace(' Nintendo','').replace(' Game Freak','').strip(),
-                header['region'], header['region_char'], [], {}, header.get('is_english', True)
+                header['region'], header['region_char'], structure, rom_stats, header.get('is_english', True)
             )
 
         game_info = GAME_INFO.get(gc, {})
@@ -4146,7 +3944,7 @@ async def spotlight(path: str) -> dict:
 
     # Build Eonet in background for interactive spotlight calls only.
     # During restore, _do_pending_restore runs BFS sequentially — skip here to avoid double-BFS race.
-    if current_rom and current_rom['type'] == 'nds' and not _rom_restore_in_progress:
+    if current_rom and current_rom['type'] in ('nds', '3ds') and not _rom_restore_in_progress:
         import asyncio as _asyncio
         _gc_capture = gc
         try:
@@ -4318,12 +4116,74 @@ async def return_tool(save: bool = False) -> dict:
     return result
 
 
+def _summarize_3ds(path: str, expand_narcs: bool = False) -> dict:
+    """Summarize 3DS RomFS filesystem at a path."""
+    fs = current_rom['romfs_files']
+    fh = current_rom['romfs_fh']
+    contents = []
+
+    clean = path.strip('/')
+
+    # Drill into a specific GARC (e.g. "a/0/1/7")
+    if clean and clean in fs:
+        abs_off = fs[clean][0]
+        try:
+            garc_files = read_garc_all(fh, abs_off)
+            role = narc_roles.get(clean)
+            gc = current_rom['header']['game_code']
+            garc_lbl = eonet_labels.get(gc, {}).get(clean, {}).get('labels', {})
+            for i, f in enumerate(garc_files):
+                entry = {"index": i, "size": len(f), "path": f"{clean}:{i}"}
+                if garc_lbl.get(i): entry["label"] = garc_lbl[i]
+                contents.append(entry)
+            result = {"path": clean, "type": "garc", "file_count": len(garc_files), "contents": contents}
+            if role: result["role"] = role
+            return result
+        except Exception:
+            return {"path": clean, "type": "file", "size": fs[clean][1]}
+
+    # Folder listing — find unique children at this level
+    prefix = (clean + '/') if clean else ''
+    seen_dirs = set()
+    for fpath in sorted(fs.keys()):
+        if not fpath.startswith(prefix):
+            continue
+        rest = fpath[len(prefix):]
+        if '/' in rest:
+            # It's a subfolder
+            dirname = rest.split('/')[0]
+            if dirname not in seen_dirs:
+                seen_dirs.add(dirname)
+                contents.append({"name": dirname + "/", "type": "folder"})
+        else:
+            # It's a file at this level
+            abs_off, size = fs[fpath]
+            entry = {"name": rest, "type": "file", "size": size, "path": fpath}
+            # Check if GARC
+            try:
+                garc_files = read_garc_all(fh, abs_off)
+                entry["type"] = "garc"
+                entry["file_count"] = len(garc_files)
+                role = narc_roles.get(fpath)
+                if role: entry["role"] = role
+            except Exception:
+                pass
+            contents.append(entry)
+
+    if not contents:
+        return {"error": f"Path not found: {path}"}
+    return {"path": path, "contents": contents}
+
+
 async def summarize(path: str = "/", expand_narcs: bool = False) -> dict:
     """List contents at a path. Pass a NARC path to see its contents."""
     if not current_rom:
         return "Error: No ROM currently open"
 
-    if current_rom['type'] != 'nds':
+    if current_rom['type'] == '3ds':
+        return _summarize_3ds(path, expand_narcs)
+
+    if current_rom['type'] not in ('nds',):
         return {"path": path, "contents": [], "note": "No filesystem for GB/GBA ROMs"}
 
     rom = current_rom['rom']

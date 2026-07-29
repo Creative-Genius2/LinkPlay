@@ -355,3 +355,112 @@ def decode_pokeathlon_performance(data: bytes, text_tables: dict, file_idx: int 
     lines = [f"{title} ({sp_display}) — Pokéathlon"]
     lines.append(" | ".join(parts))
     return "\n".join(lines)
+
+
+_GEN4_FLIPNOTE_PAIRS = {
+    # Gen IV
+    'Pokémon Diamond & Pearl': ['ADA', 'APA'],
+    'Pokémon Platinum': ['CPU'],
+    'Pokémon HeartGold & SoulSilver': ['IPK', 'IPG'],
+}
+
+
+_GEN4_GAME_INFO = {
+    # Gen IV — Nintendo DS
+    'ADA': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2007, 'narcs': {**_GEN4_DP_COMMON, 'encounters': 'fielddata/encountdata/d_enc_data.narc'}},  # Diamond US
+    'APA': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2007, 'narcs': {**_GEN4_DP_COMMON, 'encounters': 'fielddata/encountdata/p_enc_data.narc'}},  # Pearl US
+    'CPU': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2009, 'narcs': {**_GEN4_COMMON, **_GEN4_PLATINUM_OVERRIDES}},                      # Platinum US
+    'IPK': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2010, 'narcs': {**_GEN4_HGSS}},                                                    # HeartGold US
+    'IPG': {'gen': 4, 'platform': 'Nintendo DS', 'year': 2010, 'narcs': {**_GEN4_HGSS}},                                                    # SoulSilver US
+}
+
+
+_GEN4_TRAINER_LOCATIONS = {
+    # Gen IV - Diamond/Pearl
+    "ADA": {
+        ("Leader", "Roark"): "Oreburgh Gym",
+        ("Leader", "Gardenia"): "Eterna Gym",
+        ("Leader", "Maylene"): "Veilstone Gym",
+        ("Leader", "Crasher Wake"): "Pastoria Gym",
+        ("Leader", "Wake"): "Pastoria Gym",
+        ("Leader", "Fantina"): "Hearthome Gym",
+        ("Leader", "Byron"): "Canalave Gym",
+        ("Leader", "Candice"): "Snowpoint Gym",
+        ("Leader", "Volkner"): "Sunyshore Gym",
+        ("Elite Four", "Aaron"): "Pokémon League",
+        ("Elite Four", "Bertha"): "Pokémon League",
+        ("Elite Four", "Flint"): "Pokémon League",
+        ("Elite Four", "Lucian"): "Pokémon League",
+        ("Champion", "Cynthia"): "Pokémon League",
+    },
+    "APA": "ADA",  # Pearl alias
+    
+    # Gen IV - Platinum
+    "CPU": {
+        ("Leader", "Roark"): "Oreburgh Gym",
+        ("Leader", "Gardenia"): "Eterna Gym",
+        ("Leader", "Fantina"): "Hearthome Gym",
+        ("Leader", "Maylene"): "Veilstone Gym",
+        ("Leader", "Crasher Wake"): "Pastoria Gym",
+        ("Leader", "Wake"): "Pastoria Gym",
+        ("Leader", "Byron"): "Canalave Gym",
+        ("Leader", "Candice"): "Snowpoint Gym",
+        ("Leader", "Volkner"): "Sunyshore Gym",
+        ("Elite Four", "Aaron"): "Pokémon League",
+        ("Elite Four", "Bertha"): "Pokémon League",
+        ("Elite Four", "Flint"): "Pokémon League",
+        ("Elite Four", "Lucian"): "Pokémon League",
+        ("Champion", "Cynthia"): "Pokémon League",
+        ("Tower Tycoon", "Palmer"): "Battle Tower",
+    },
+    
+    # Gen IV - HeartGold/SoulSilver
+    "IPK": {
+        # Johto Gym Leaders
+        ("Leader", "Falkner"): "Violet Gym",
+        ("Leader", "Bugsy"): "Azalea Gym",
+        ("Leader", "Whitney"): "Goldenrod Gym",
+        ("Leader", "Morty"): "Ecruteak Gym",
+        ("Leader", "Chuck"): "Cianwood Gym",
+        ("Leader", "Jasmine"): "Olivine Gym",
+        ("Leader", "Pryce"): "Mahogany Gym",
+        ("Leader", "Clair"): "Blackthorn Gym",
+        # Kanto Gym Leaders (class = name in HGSS)
+        ("Leader", "Brock"): "Pewter Gym",
+        ("Leader", "Misty"): "Cerulean Gym",
+        ("Leader", "Lt. Surge"): "Vermilion Gym",
+        ("Leader", "Erika"): "Celadon Gym",
+        ("Leader", "Janine"): "Fuchsia Gym",
+        ("Leader", "Sabrina"): "Saffron Gym",
+        ("Leader", "Blaine"): "Seafoam Gym",
+        ("Leader", "Blue"): "Viridian Gym",
+        # Elite Four & Champion
+        ("Elite Four", "Will"): "Indigo Plateau",
+        ("Elite Four", "Koga"): "Indigo Plateau",
+        ("Elite Four", "Bruno"): "Indigo Plateau",
+        ("Elite Four", "Karen"): "Indigo Plateau",
+        ("Champion", "Lance"): "Indigo Plateau",
+        # Special
+        ("PKMN Trainer", "Red"): "Mt. Silver (Summit)",
+    },
+    "IPG": "IPK",  # SoulSilver alias
+}
+
+
+_GEN4_CLASS_LOCATIONS = {
+    "ADA": {"Elite Four": "Pokémon League", "Champion": "Pokémon League"},
+    "APA": "ADA",
+    "CPU": {"Elite Four": "Pokémon League", "Champion": "Pokémon League", "Tower Tycoon": "Battle Tower"},
+    "IPK": {"Elite Four": "Indigo Plateau", "Champion": "Indigo Plateau",
+            "Brock": "Pewter Gym", "Misty": "Cerulean Gym", "Lt. Surge": "Vermilion Gym",
+            "Erika": "Celadon Gym", "Janine": "Fuchsia Gym", "Sabrina": "Saffron Gym",
+            "Blaine": "Seafoam Gym", "Blue": "Viridian Gym"},
+    "IPG": "IPK",
+}
+
+
+_GEN4_TM_SEARCH = {
+    4: (bytes([0x08, 0x01, 0x51, 0x01, 0x60, 0x01, 0x5B, 0x01]), 100),  # 92 TMs + 8 HMs
+}
+
+MOVE_CATEGORIES_G4 = {0: "Physical", 1: "Special", 2: "Status"}

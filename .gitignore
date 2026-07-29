@@ -7,6 +7,10 @@
 !scripts/setup_tools.py
 !Generations/
 !Generations/*.py
+# Not yet supported — don't ship what doesn't work
+Generations/gen6_xy_oras.py
+Generations/gen8_swsh.py
+Generations/gen9_scarvio.py
 !eonet_driver.py
 !eonet_launcher.py
 !xoleon.py
@@ -23,3 +27,6 @@
 !docs/
 !docs/*.md
 !.gitignore
+
+# Local tools — not part of the server
+server-to-Gens.py

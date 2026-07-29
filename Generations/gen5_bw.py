@@ -718,3 +718,125 @@ def decode_pwt_tournament_def(data: bytes, file_idx: int = 0):
                 pass
 
     return "\n".join(out)
+
+
+_GEN5_FLIPNOTE_PAIRS = {
+    # Gen V
+    'Pokémon Black & White': ['IRB', 'IRA'],
+    'Pokémon Black & White 2': ['IRE', 'IRD'],
+}
+
+
+_GEN5_GAME_INFO = {
+    # Gen V — Nintendo DS
+    'IRE': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2012, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # Black 2 US
+    'IRD': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2012, 'narcs': {**_GEN5_B2W2, **_B2W2_ENCOUNTERS, **_B2W2_PWT, **_B2W2_SUBWAY}},  # White 2 US
+    'IRB': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2011, 'narcs': {**_GEN5_BW1, **_BW1_ENCOUNTERS, **_BW1_SUBWAY}},                  # Black US
+    'IRA': {'gen': 5, 'platform': 'Nintendo DS', 'year': 2011, 'narcs': {**_GEN5_BW1, **_BW1_ENCOUNTERS, **_BW1_SUBWAY}},                  # White US
+}
+
+
+_GEN5_TRAINER_LOCATIONS = {
+    # Gen V - Black/White
+    "IRB": {
+        ("Leader", "Cilan"): "Striaton Gym",
+        ("Leader", "Chili"): "Striaton Gym",
+        ("Leader", "Cress"): "Striaton Gym",
+        ("Leader", "Lenora"): "Nacrene Gym",
+        ("Leader", "Burgh"): "Castelia Gym",
+        ("Leader", "Elesa"): "Nimbasa Gym",
+        ("Leader", "Clay"): "Driftveil Gym",
+        ("Leader", "Skyla"): "Mistralton Gym",
+        ("Leader", "Brycen"): "Icirrus Gym",
+        ("Leader", "Drayden"): "Opelucid Gym",
+        ("Leader", "Iris"): "Opelucid Gym",
+        ("Elite Four", "Shauntal"): "Pokémon League",
+        ("Elite Four", "Grimsley"): "Pokémon League",
+        ("Elite Four", "Caitlin"): "Pokémon League",
+        ("Elite Four", "Marshal"): "Pokémon League",
+        ("Champion", "Alder"): "Pokémon League",
+        ("PKMN Trainer", "N"): "N's Castle",
+        ("Subway Boss", "Ingo"): "Battle Subway",
+        ("Subway Boss", "Emmet"): "Battle Subway",
+    },
+    "IRA": "IRB",  # White alias
+    
+    # Gen V - Black 2/White 2
+    "IRE": {
+        ("Leader", "Cheren"): "Aspertia Gym",
+        ("Leader", "Roxie"): "Virbank Gym",
+        ("Leader", "Burgh"): "Castelia Gym",
+        ("Leader", "Elesa"): "Nimbasa Gym",
+        ("Leader", "Clay"): "Driftveil Gym",
+        ("Leader", "Skyla"): "Mistralton Gym",
+        ("Leader", "Drayden"): "Opelucid Gym",
+        ("Leader", "Marlon"): "Humilau Gym",
+        ("Elite Four", "Shauntal"): "Pokémon League",
+        ("Elite Four", "Grimsley"): "Pokémon League",
+        ("Elite Four", "Caitlin"): "Pokémon League",
+        ("Elite Four", "Marshal"): "Pokémon League",
+        ("Champion", "Iris"): "Pokémon League",
+        ("Subway Boss", "Ingo"): "Battle Subway",
+        ("Subway Boss", "Emmet"): "Battle Subway",
+    },
+    "IRD": "IRE",  # White 2 alias
+}
+
+
+_GEN5_CLASS_LOCATIONS = {
+    "IRB": {"Elite Four": "Pokémon League", "Champion": "Pokémon League", "Subway Boss": "Battle Subway"},
+    "IRA": "IRB",
+    "IRE": {
+        "Elite Four": "Pokémon League", "Champion": "Pokémon League", "Subway Boss": "Battle Subway",
+        # PWT participants (class = name)
+        "Brock": "Pokémon World Tournament", "Misty": "Pokémon World Tournament",
+        "Lt. Surge": "Pokémon World Tournament", "Erika": "Pokémon World Tournament",
+        "Sabrina": "Pokémon World Tournament", "Blaine": "Pokémon World Tournament",
+        "Giovanni": "Pokémon World Tournament", "Falkner": "Pokémon World Tournament",
+        "Bugsy": "Pokémon World Tournament", "Whitney": "Pokémon World Tournament",
+        "Morty": "Pokémon World Tournament", "Chuck": "Pokémon World Tournament",
+        "Jasmine": "Pokémon World Tournament", "Pryce": "Pokémon World Tournament",
+        "Clair": "Pokémon World Tournament", "Janine": "Pokémon World Tournament",
+        "Roxanne": "Pokémon World Tournament", "Brawly": "Pokémon World Tournament",
+        "Wattson": "Pokémon World Tournament", "Flannery": "Pokémon World Tournament",
+        "Norman": "Pokémon World Tournament", "Winona": "Pokémon World Tournament",
+        "Tate": "Pokémon World Tournament", "Liza": "Pokémon World Tournament",
+        "Juan": "Pokémon World Tournament", "Roark": "Pokémon World Tournament",
+        "Gardenia": "Pokémon World Tournament", "Fantina": "Pokémon World Tournament",
+        "Maylene": "Pokémon World Tournament", "Wake": "Pokémon World Tournament",
+        "Byron": "Pokémon World Tournament", "Candice": "Pokémon World Tournament",
+        "Volkner": "Pokémon World Tournament", "Blue": "Pokémon World Tournament",
+        "Lance": "Pokémon World Tournament", "Steven": "Pokémon World Tournament",
+        "Wallace": "Pokémon World Tournament", "Red": "Pokémon World Tournament",
+        "Cynthia": "Pokémon World Tournament", "Alder": "Pokémon World Tournament",
+    },
+    "IRD": "IRE",
+}
+
+
+_GEN5_TM_SEARCH = {
+    5: (bytes([0xD4, 0x01, 0x51, 0x01, 0xD9, 0x01, 0x5B, 0x01]), 101),  # 95 TMs + 6 HMs
+}
+
+MOVE_CATEGORIES_G5 = {0: "Status", 1: "Physical", 2: "Special"}
+
+_FORM_NAMES = {
+    (351, 1): "Sunny", (351, 2): "Rainy", (351, 3): "Snowy",
+    (386, 1): "Attack", (386, 2): "Defense", (386, 3): "Speed",
+    (412, 0): "Plant", (412, 1): "Sandy", (412, 2): "Trash",
+    (413, 0): "Plant", (413, 1): "Sandy", (413, 2): "Trash",
+    (421, 1): "Sunshine",
+    (422, 0): "West", (422, 1): "East",
+    (423, 0): "West", (423, 1): "East",
+    (479, 1): "Heat", (479, 2): "Wash", (479, 3): "Frost", (479, 4): "Fan", (479, 5): "Mow",
+    (487, 1): "Origin",
+    (492, 1): "Sky",
+    (550, 0): "Red-Striped", (550, 1): "Blue-Striped",
+    (555, 0): "Standard", (555, 1): "Zen Mode",
+    (585, 0): "Spring", (585, 1): "Summer", (585, 2): "Autumn", (585, 3): "Winter",
+    (586, 0): "Spring", (586, 1): "Summer", (586, 2): "Autumn", (586, 3): "Winter",
+    (641, 1): "Therian", (642, 1): "Therian", (645, 1): "Therian",
+    (646, 1): "White", (646, 2): "Black",
+    (647, 1): "Resolute",
+    (648, 1): "Pirouette",
+}

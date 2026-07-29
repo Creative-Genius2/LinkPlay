@@ -382,6 +382,12 @@ async def _restore_roms_from_registry():
     return len(srv.loaded_roms) - initial_count
 
 
+class _GarcWrap:
+    """Wraps a list of byte arrays to look like an ndspy NARC for ICR."""
+    def __init__(self, file_list):
+        self.files = file_list
+
+
 def _walk_all_narcs():
     """Yield (narc_path, ndspy.narc.NARC) for every NARC in the ROM filesystem."""
     import ndspy.narc
@@ -406,6 +412,28 @@ def _walk_all_narcs():
 
     if rom.filenames:
         yield from _walk(rom.filenames)
+
+
+def _walk_all_garcs():
+    """Yield (garc_path, _GarcWrap) for every GARC in the 3DS RomFS.
+
+    Reads each GARC on demand from the file handle — never loads all into RAM.
+    """
+    srv = _srv()
+    if not srv.current_rom or srv.current_rom['type'] != '3ds':
+        return
+    fh = srv.current_rom['romfs_fh']
+    fs = srv.current_rom['romfs_files']
+    from xoleon import read_garc_all
+
+    for gpath in sorted(fs.keys()):
+        abs_off = fs[gpath][0]
+        try:
+            file_list = read_garc_all(fh, abs_off)
+            if len(file_list) >= 2:
+                yield gpath, _GarcWrap(file_list)
+        except Exception:
+            pass
 
 
 def _icr_get_tables():
@@ -1593,7 +1621,9 @@ def _build_eonet(gc=None):
     val_lookup = _icr_build_val_lookup(tables)
 
     all_narcs = {}
-    for narc_path, narc in _walk_all_narcs():
+    rom_type = srv.current_rom.get('type', 'nds')
+    walker = _walk_all_garcs() if rom_type == '3ds' else _walk_all_narcs()
+    for narc_path, narc in walker:
         all_narcs[narc_path] = narc
 
     def _connected(other_narc, edge_values):

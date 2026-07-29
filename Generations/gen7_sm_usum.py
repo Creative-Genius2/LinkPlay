@@ -46,3 +46,19 @@ _GEN7_SM = {
 _GEN7_LGPE = {
     # TBD: Switch ROM support not yet implemented
 }
+
+
+_GEN7_FLIPNOTE_PAIRS = {
+    # Gen VII
+    'Pokémon Ultra Sun & Ultra Moon': ['A2A', 'A2B'],
+    'Pokémon Sun & Moon': ['1Q1', '1Q2'],
+}
+
+
+_GEN7_GAME_INFO = {
+    # Gen VII — Nintendo 3DS
+    'A2B': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2017, 'title': 'Pokémon Ultra Moon', 'narcs': {**_GEN7_USUM}},    # Ultra Moon
+    'A2A': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2017, 'title': 'Pokémon Ultra Sun', 'narcs': {**_GEN7_USUM}},     # Ultra Sun
+    '1Q2': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2016, 'title': 'Pokémon Moon', 'narcs': {**_GEN7_SM}},            # Moon
+    '1Q1': {'gen': 7, 'platform': 'Nintendo 3DS', 'year': 2016, 'title': 'Pokémon Sun', 'narcs': {**_GEN7_SM}},             # Sun
+}
