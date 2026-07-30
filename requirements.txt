@@ -1,6 +1,7 @@
 # Python dependencies (installed via uv/pip)
 mcp
 ndspy>=4.0.0
+xoleon>=0.1.0
 Pillow>=10.0.0  # PNG sprite conversion (sprite_convert tool)
 aiohttp>=3.9.0  # HTTP proxy for Eonet Method B (Claude Desktop)
 cryptography>=41.0.0  # Self-signed cert generation for Eonet --setup

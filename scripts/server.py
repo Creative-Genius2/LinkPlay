@@ -110,6 +110,7 @@ from Generations.gen5_bw import (
 )
 from xoleon import (
     read_3ds_header, open_3ds_romfs, read_garc_sub, read_garc_all,
+    decompress_lz11, compress_lz11,
 )
 
 
@@ -1052,8 +1053,14 @@ def decompress_data(data: bytes) -> tuple:
     if compression == 'none':
         return data, 'none'
 
+    if compression == 'lz11':
+        try:
+            return decompress_lz11(data), 'lz11'
+        except Exception:
+            return data, compression
+
     tool_map = {
-        'lz10': 'lzss', 'lz11': 'lzx', 'lz40': 'lzx',
+        'lz10': 'lzss', 'lz40': 'lzx',
         'huffman4': 'huffman', 'huffman8': 'huffman', 'rle': 'rle'
     }
 
@@ -1097,8 +1104,14 @@ def compress_data(data: bytes, compression: str) -> bytes:
     if compression == 'none' or not compression:
         return data
 
+    if compression == 'lz11':
+        try:
+            return compress_lz11(data)
+        except Exception:
+            return data
+
     tool_map = {
-        'lz10': ('lzss', '-evn'), 'lz11': ('lzx', '-evb'), 'lz40': ('lzx', '-evb'),
+        'lz10': ('lzss', '-evn'), 'lz40': ('lzx', '-evb'),
         'huffman4': ('huffman', '-e4'), 'huffman8': ('huffman', '-e8'), 'rle': ('rle', '-e')
     }
 

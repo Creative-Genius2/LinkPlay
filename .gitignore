@@ -30,3 +30,8 @@ Generations/gen9_scarvio.py
 
 # Local tools — not part of the server
 server-to-Gens.py
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
