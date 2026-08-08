@@ -7,6 +7,8 @@
 !scripts/setup_tools.py
 !Generations/
 !Generations/*.py
+# Old-name leftovers — keep on disk, never push
+Generations/gen[0-9]*.py
 !eonet_driver.py
 !eonet_launcher.py
 
