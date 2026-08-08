@@ -1,4 +1,4 @@
-# LinkPlay Installation Guide
+# Silphéon Installation Guide
 
 ## Quick Start
 
@@ -12,7 +12,7 @@ Or download from: https://docs.astral.sh/uv/getting-started/installation/
 
 ### 2. Configure Your MCP Client
 
-LinkPlay works with any MCP-compatible client. Add it to your client's MCP config.
+Silphéon works with any MCP-compatible client. Add it to your client's MCP config.
 
 #### Claude Desktop
 
@@ -29,11 +29,11 @@ See `mcp_config.example.json` for the config format.
 ```json
 {
   "mcpServers": {
-    "linkplay": {
+    "Silphéon": {
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/LinkPlay",
+        "/absolute/path/to/Silphéon",
         "run",
         "python",
         "scripts/server.py"
@@ -43,15 +43,15 @@ See `mcp_config.example.json` for the config format.
 }
 ```
 
-> **Important:** Replace the path with the actual absolute path to your LinkPlay directory.
-> On Windows, use double backslashes: `"C:\\Users\\you\\LinkPlay"`
+> **Important:** Replace the path with the actual absolute path to your Silphéon directory.
+> On Windows, use double backslashes: `"C:\\Users\\you\\Silphéon"`
 
 ### 3. Restart Your Client
 
 On first run, `uv` will:
 - Create a virtual environment in `.venv/`
 - Install all dependencies from `requirements.txt`
-- Start the LinkPlay server
+- Start the Silphéon server
 - Auto-download compression tools on first ROM open
 
 ### 4. Test It
@@ -88,7 +88,7 @@ CUE's DS/GBA Compressors (blz, lzss, lzx, huffman, rle) are **auto-downloaded** 
 To verify the server starts correctly:
 
 ```bash
-cd /path/to/LinkPlay
+cd /path/to/Silphéon
 uv run python scripts/server.py
 ```
 
@@ -104,7 +104,7 @@ pip install uv
 
 ### "Module not found: setup_tools"
 
-The `--directory` path must point to the LinkPlay **root** directory (not `scripts/`).
+The `--directory` path must point to the Silphéon **root** directory (not `scripts/`).
 
 ### Tools don't appear in client
 
@@ -120,12 +120,12 @@ Tools auto-download on first ROM open. If it fails due to network issues:
 
 ### Cross-platform
 
-LinkPlay is developed on Windows. The compression tools are Windows executables (`.exe`). For macOS/Linux, you'll need to compile CUE's compressors from source or use Wine.
+Silphéon is developed on Windows. The compression tools are Windows executables (`.exe`). For macOS/Linux, you'll need to compile CUE's compressors from source or use Wine.
 
 ## File Structure
 
 ```
-LinkPlay/
+Silphéon/
 ├── scripts/
 │   ├── server.py          # MCP server — all tools and decoders
 │   ├── setup_tools.py     # Compression tool auto-download

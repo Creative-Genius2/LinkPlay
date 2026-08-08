@@ -1,11 +1,11 @@
 ---
-name: linkplay
-description: Use when the user mentions .nds, .gba, .gbc, .gb files, ROM hacking, NARCs, ARM9, game data extraction, Pokémon ROM data, trainer teams, base stats, learnsets, battle facilities, PWT, Battle Tower, Battle Subway, Gen I/II/III/IV/V Pokémon games, or any request to explore, read, modify, or document Nintendo ROM contents. LinkPlay is an MCP server for Pokémon ROMs across all generations (Gen I GB through Gen V DS). It decrypts text, decodes binary structures (trainers, personal data, encounters, learnsets, moves, items), and provides persistent notes (Flipnotes) across sessions. Gen V and IV have full decode support. Gen III GBA has trainers/personal/moves. Gen I JP has personal/trainers/species/moves. Gen II and Gen I EN are partially supported.
+name: Silphéon
+description: Use when the user mentions .nds, .gba, .gbc, .gb files, ROM hacking, NARCs, ARM9, game data extraction, Pokémon ROM data, trainer teams, base stats, learnsets, battle facilities, PWT, Battle Tower, Battle Subway, Gen I/II/III/IV/V Pokémon games, or any request to explore, read, modify, or document Nintendo ROM contents. Silphéon is an MCP server for Pokémon ROMs across all generations (Gen I GB through Gen V DS). It decrypts text, decodes binary structures (trainers, personal data, encounters, learnsets, moves, items), and provides persistent notes (Flipnotes) across sessions. Gen V and IV have full decode support. Gen III GBA has trainers/personal/moves. Gen I JP has personal/trainers/species/moves. Gen II and Gen I EN are partially supported.
 ---
 
-# LinkPlay — Portable Skill Reference
+# Silphéon — Portable Skill Reference
 
-This document is your working reference for the LinkPlay MCP server. Use it to understand what each tool does, what data you can decode, and how to interpret results.
+This document is your working reference for the Silphéon MCP server. Use it to understand what each tool does, what data you can decode, and how to interpret results.
 
 ## Tool Reference
 
@@ -106,7 +106,7 @@ Reads typed values from files without manual hex math. Annotates u16/u32 values 
 
 #### `note` / `batch_notes` / `edit_note` / `delete_note` / `list_flipnotes` / `view_flipnote`
 
-Persistent research notes stored in `~/.linkplay/flipnotes/`. Paired games share flipnotes.
+Persistent research notes stored in `~/.silphéon/flipnotes/`. Paired games share flipnotes.
 
 ---
 

@@ -1,27 +1,31 @@
-# LinkPlay
+# Silphéon: A MCP Server For Pokémon fans
 
-*Link Cable + Download Play*
-
-A general-purpose MCP server for Pokémon games — Gen I through Gen V, GB through DS. Trainers, base stats, learnsets, encounters, moves, items, text tables, battle facilities, and more, across every main-series game from 1996 to 2012.
+A general-purpose MCP server for Pokémon games — Gen I through Gen IX, Game Boy through Nintendo Switch. Trainers, base stats, learnsets, encounters, moves, items, text tables, battle facilities, and more, across every main-series game from 1996 to 2025.
 
 ---
 
 ## What It Does
 
-DS ROMs are filesystems — folders, NARCs, structured binary. GB and GBA ROMs are flat binaries with known offsets. LinkPlay handles both. Open a ROM, decode what's inside, write changes back, save. Persistent notes (Flipnotes) mean knowledge carries across sessions.
+Switch ROMs are encrypted containers — XCI/NSP with NCA, RomFS, and FlatBuffer data inside. DS and 3DS ROMs are filesystems — folders, NARCs/GARCs, structured binary. GB and GBA ROMs are flat binaries with known offsets. Silphéon handles all of them. Open a ROM, decode what's inside, write changes back, save. Persistent notes (Flipnotes) mean knowledge carries across sessions.
 
-The same tools work whether you're reading Cheren's team in Black 2, Brock's party in Pocket Monsters Green, or wild encounters in HeartGold. The server figures out the format.
+The same tools work whether you're reading Cheren's team in Black 2, Brock's party in Pokémon Green, or wild encounters in HeartGold. The server figures out the format.
 
 ## Supported Games
 
-| Generation | Games | Text Decryption | Auto-Decode |
-|------------|-------|-----------------|-------------|
-| **Gen V** | Black, White, Black 2, White 2 | ✅ Gen V XOR + ROL3 | ✅ Full |
-| **Gen IV** | Diamond, Pearl, Platinum, HeartGold, SoulSilver | ✅ Gen IV XOR + 0xF100-flagged 9-bit packing | ✅ Full |
-| **Gen III (GBA)** | FireRed, LeafGreen, Ruby, Sapphire, Emerald | ✅ EN charmap | ✅ Trainers, personal, moves, learnsets |
-| **Gen I JP (GB)** | Red JP, Green JP, Blue JP, Yellow JP | ✅ JP charmap (disassembly-verified) | ✅ Personal, trainers, species, moves |
-| **Gen I EN (GB)** | Red EN, Blue EN, Yellow EN | ✅ EN charmap | ⚠️ Partial — species/moves only |
-| **Gen II (GBC)** | Gold, Silver, Crystal | ✅ EN charmap | ⚠️ Partial — trainers, encounters |
+| Generation | Games | Platform | Auto-Decode |
+|------------|-------|----------|-------------|
+| **Gen IX** | Legends: Z-A | Switch | ✅ Full (FlatBuffer) |
+| **Gen IX** | Scarlet, Violet | Switch | ✅ Full (FlatBuffer) |
+| **Gen VIII** | Legends: Arceus | Switch | ✅ Full (FlatBuffer) |
+| **Gen VIII** | Sword, Shield | Switch | ✅ Full (FlatBuffer) |
+| **Gen VII** | Let's Go Pikachu, Let's Go Eevee | Switch | ✅ Full (FlatBuffer) |
+| **Gen VII** | Sun, Moon, Ultra Sun, Ultra Moon | 3DS | ✅ Full |
+| **Gen VI** | X, Y, Omega Ruby, Alpha Sapphire | 3DS | ✅ Full |
+| **Gen V** | Black, White, Black 2, White 2 | DS | ✅ Full |
+| **Gen IV** | Diamond, Pearl, Platinum, HeartGold, SoulSilver | DS | ✅ Full |
+| **Gen III** | Ruby, Sapphire, Emerald, FireRed, LeafGreen | GBA | ✅ Full |
+| **Gen II** | Gold, Silver, Crystal | GBC | ⚠️ Partial |
+| **Gen I** | Red, Blue, Green, Yellow (JP + EN) | GB | ✅ Full |
 
 ## What You Can Decode
 
@@ -71,9 +75,9 @@ Paired games share flipnotes — Diamond & Pearl, HeartGold & SoulSilver, Black 
 
 ## Eonet (Optional)
 
-The Eonet system (`eonet_driver.py`) is an optional client-side orchestrator that sits between the user and Claude. It uses iterative cross-referencing (ICR) to automatically discover what each NARC file contains by matching binary content against decoded text tables. When a user asks "What's Iris's team?", Eonet resolves `a/0/9/1:47` and `a/0/9/2:47` before Claude even sees the message.
+The Eonet (`eonet_driver.py`) is an optional proxy that sits between the user and Claude. It uses iterative cross-referencing (ICR) to automatically discover what each NARC file contains by matching binary content against decoded text tables. When a user asks Claude "What's Iris's team?", Eonet resolves `a/0/9/1:47` and `a/0/9/2:47` before the model even sees the message.
 
-See `docs/ICR.md` for the underlying pattern.
+See `docs/ICR.md` for details on how ICR works.
 
 ## Setup
 
@@ -91,11 +95,11 @@ Add to your MCP config (Claude Desktop, Antigravity, etc.):
 ```json
 {
   "mcpServers": {
-    "linkplay": {
+    "Silphéon": {
       "command": "uv",
       "args": [
         "--directory",
-        "/path/to/LinkPlay",
+        "/path/to/Silphéon",
         "run",
         "python",
         "scripts/server.py"
@@ -109,11 +113,11 @@ Add to your MCP config (Claude Desktop, Antigravity, etc.):
 ```json
 {
   "mcpServers": {
-    "linkplay": {
+    "Silphéon": {
       "command": "uv",
       "args": [
         "--directory",
-        "/path/to/LinkPlay",
+        "/path/to/Silphéon",
         "run",
         "python",
         "eonet_driver.py",
@@ -124,7 +128,7 @@ Add to your MCP config (Claude Desktop, Antigravity, etc.):
 }
 ```
 
-Replace the path with your actual LinkPlay directory. See `our_mcp_config.json` for a working example.
+Replace the path with your actual Silphéon directory.
 
 ### 3. Restart Your Client
 
@@ -134,7 +138,7 @@ See `INSTALL.md` for detailed setup and troubleshooting.
 
 ## In Practice
 
-Open HeartGold. Ask for Route 43's encounters. Get back:
+Open Sword. Ask for Route 1's encounters. Get species, levels, weather conditions, and overworld/grass split. Open HeartGold. Ask for Route 43's encounters. Get back:
 
 ```
 Route 43
@@ -155,18 +159,15 @@ Document what you find. Come back a week later. It's all still there.
 - `mcp` — Model Context Protocol
 - `ndspy` — DS ROM/NARC handling
 - `aiohttp` — HTTP proxy for Eonet
-- `cryptography` — TLS cert generation for Eonet
+- `cryptography` — TLS cert generation for Eonet; Switch NCA decryption
+- `pycryptodome` — Switch NCA/XCI decryption (AES-CTR, AES-ECB)
 - `Pillow` — PNG sprite conversion
 - `spacy` — NLP for Eonet resolution
 - `curl-cffi` — Cloudflare bypass for tool downloads
 
-**Compression tools** (auto-downloaded on first run):
-CUE's DS/GBA Compressors — blz, lzss, lzx, huffman, rle
+**Compression tools** (auto-downloaded on first run via setup_tools.py):
+downloads CUE's DS/GBA Compressors including blz, lzss, lzx, huffman, rle
 
 ## Status
 
-Tested against 14 Pokémon ROMs — Gen I through Gen V, GB through DS. Decodes trainers, encounters, base stats, learnsets, evolutions, moves, items, battle facilities, and all text. Location name resolution verified for DP, Pt, HGSS, BW, and B2W2.
-
----
-
-*Named for the link cable that connected Game Boys and the Download Play that shared DS games. Connection. Sharing. Play.*
+Tested against 20+ Pokémon ROMs — Gen I through Gen IX, Game Boy through Nintendo Switch. Decodes trainers, encounters, base stats, learnsets, evolutions, moves, items, battle facilities, and all text. Location name resolution verified for DP, Pt, HGSS, BW, and B2W2.

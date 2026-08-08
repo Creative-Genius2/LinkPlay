@@ -1,4 +1,4 @@
-# LinkPlay Tool Specifications
+# Silphéon Tool Specifications
 
 ## ROM Operations
 
@@ -166,7 +166,7 @@ Documentation coverage report for the current Flipnote.
 
 ## Flipnote Operations
 
-Flipnotes are persistent JSON files (`~/.linkplay/flipnotes/`) that store knowledge about each game's ROM structure across sessions. Paired games share flipnotes.
+Flipnotes are persistent JSON files (`~/.silphéon/flipnotes/`) that store knowledge about each game's ROM structure across sessions. Paired games share flipnotes.
 
 ### list_flipnotes
 Lists all Flipnote files with game code, title, and note count.

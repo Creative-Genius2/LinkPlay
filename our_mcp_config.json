@@ -1,10 +1,10 @@
 {
   "mcpServers": {
-    "linkplay": {
+    "Silphéon": {
       "command": "uv",
       "args": [
         "--directory",
-        "C:\\Users\\prado\\Downloads\\LinkPlay",
+        "C:\\Users\\prado\\Downloads\\Silphéon",
         "run",
         "python",
         "scripts/server.py"

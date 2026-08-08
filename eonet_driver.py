@@ -32,6 +32,9 @@ from pathlib import Path
 from typing import Optional
 
 
+from Generations.sdk import SDK
+
+
 class EonetDriver:
     """Client-side driver for API consumers (not the Desktop proxy path).
 
@@ -321,7 +324,6 @@ import re
 # ============================================================
 # Auto-discovery engine. Moved from server.py.
 # server.py imports _build_eonet and eonet_resolve from here.
-# Server state accessed via _srv() to avoid circular imports.
 
 # Entity metadata: which games each entity appears in
 # Built during ICR, used for smart routing
@@ -341,45 +343,18 @@ def _get_entity_generation(game_codes: set) -> int:
     return 5  # default to latest
 
 
-def _srv():
-    """Lazy import of server module. Avoids circular import at module load time."""
-    # server.py is the entry point — Python registers it as __main__, not 'server'.
-    # Check __main__ first, because that's where all the live state lives.
-    if '__main__' in sys.modules:
-        main = sys.modules['__main__']
-        if hasattr(main, 'eonet_labels'):
-            return main
+# --- Eonet state (owned here, not on server) ---
+eonet_labels = {}  # game_code -> {narc_path: {'role': str, 'labels': {idx: 'Name (Role)'}}}
+eonet_index = {}   # game_code -> [{name_lower: str, path: str, role: str, idx: int}, ...]
 
-    # Fallback: maybe it was imported as 'server' by something else
-    if 'server' in sys.modules:
-        srv = sys.modules['server']
-        if hasattr(srv, 'eonet_labels'):
-            return srv
-
-    # Last resort: import from scripts directory explicitly
-    scripts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts')
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-
-    import importlib
-    import server
-    if not hasattr(server, 'eonet_labels'):
-        import importlib.util
-        server_path = os.path.join(scripts_dir, 'server.py')
-        spec = importlib.util.spec_from_file_location("server", server_path)
-        server = importlib.util.module_from_spec(spec)
-        sys.modules['server'] = server
-        spec.loader.exec_module(server)
-
-    return server
-
+# --- Server module reference (set once at startup by whoever is __main__) ---
+_server_mod = None
 
 async def _restore_roms_from_registry():
     """Load ROMs from last_rom.json. Returns count of ROMs loaded."""
-    srv = _srv()
-    initial_count = len(srv.loaded_roms)
-    await srv._do_pending_restore()
-    return len(srv.loaded_roms) - initial_count
+    initial_count = len(_server_mod.loaded_roms)
+    await _server_mod._do_pending_restore()
+    return len(_server_mod.loaded_roms) - initial_count
 
 
 class _GarcWrap:
@@ -391,10 +366,9 @@ class _GarcWrap:
 def _walk_all_narcs():
     """Yield (narc_path, ndspy.narc.NARC) for every NARC in the ROM filesystem."""
     import ndspy.narc
-    srv = _srv()
-    if not srv.current_rom or srv.current_rom['type'] != 'nds':
+    if not _server_mod.current_rom or _server_mod.current_rom.rom_type != 'nds':
         return
-    rom = srv.current_rom['rom']
+    rom = _server_mod.current_rom.rom
 
     def _walk(folder, prefix=""):
         for filename in folder.files:
@@ -419,11 +393,10 @@ def _walk_all_garcs():
 
     Reads each GARC on demand from the file handle — never loads all into RAM.
     """
-    srv = _srv()
-    if not srv.current_rom or srv.current_rom['type'] != '3ds':
+    if not _server_mod.current_rom or _server_mod.current_rom.rom_type != '3ds':
         return
-    fh = srv.current_rom['romfs_fh']
-    fs = srv.current_rom['romfs_files']
+    fh = _server_mod.current_rom.romfs_fh
+    fs = _server_mod.current_rom.romfs_files
     from xoleon import read_garc_all
 
     for gpath in sorted(fs.keys()):
@@ -438,8 +411,7 @@ def _walk_all_garcs():
 
 def _icr_get_tables():
     """Return all decoded text tables. The seed for everything that follows."""
-    srv = _srv()
-    return {n: t for n, t in srv.text_tables.items()
+    return {n: t for n, t in (_server_mod.current_rom.text_tables if _server_mod.current_rom else {}).items()
             if isinstance(t, list) and len(t) > 2}
 
 
@@ -722,11 +694,10 @@ def _icr_read_narc(narc, tables, narc_path='', gc=None, val_lookup=None):
         # 508 base species + 46 form files = 554 in Pokéathlon, for example.
         # If this NARC has at least as many files as personal/learnsets,
         # the first N files map positionally to species.
-        srv = _srv()
-        for p, role in srv.narc_roles.items():
+        for p, role in (_server_mod.current_rom.narc_roles if _server_mod.current_rom else {}).items():
             if role in ('personal', 'learnsets', 'evolutions'):
                 try:
-                    other_fc = len(srv._get_narc(p).files)
+                    other_fc = len(_server_mod.current_rom.get_narc(p).files)
                     if fc >= other_fc - 1:
                         index_table = 'species'
                         break
@@ -941,15 +912,14 @@ def _icr_scan_arm(data, tables):
 
 def _flipnote_save():
     """Flush current flipnote to disk."""
-    srv = _srv()
-    if not srv.current_flipnote:
+    if not _server_mod.current_flipnote:
         return
-    with open(srv.current_flipnote['path'], 'w', encoding='utf-8') as f:
-        json.dump(srv.current_flipnote['data'], f, indent=2, ensure_ascii=False)
+    with open(_server_mod.current_flipnote['path'], 'w', encoding='utf-8') as f:
+        json.dump(_server_mod.current_flipnote['data'], f, indent=2, ensure_ascii=False)
 
 
 def _icr_cache_path(gc):
-    return Path.home() / ".linkplay" / "flipnotes" / f"{gc}_icr.json"
+    return Path.home() / ".silphéon" / "flipnotes" / f"{gc}_icr.json"
 
 
 def _icr_cache_save(gc):
@@ -966,7 +936,7 @@ def _icr_cache_save(gc):
 
 
 def _graph_cache_path(gc):
-    return Path.home() / ".linkplay" / "flipnotes" / f"{gc}_graph.jsonl"
+    return Path.home() / ".silphéon" / "flipnotes" / f"{gc}_graph.jsonl"
 
 
 # Open streaming writers per gc — edges written immediately, never accumulated in RAM
@@ -1044,7 +1014,7 @@ def _graph_cache_load(gc):
         _fc_offsets[gc] = fc_off
         return True
     except Exception as e:
-        print(f"[linkplay] Graph index build failed for {gc}: {e}", file=sys.stderr, flush=True)
+        print(f"[Silphéon] Graph index build failed for {gc}: {e}", file=sys.stderr, flush=True)
         return False
 
 
@@ -1083,10 +1053,9 @@ def _eonet_try_write_flipnote(narc_path, desc, file_labels, structure=None, cros
     Stores the NARC's field layout (which offsets hold which tables, u8 vs u16)
     so byte-level searches work from cache without re-running BFS.
     """
-    srv = _srv()
-    if not srv.current_rom:
+    if not _server_mod.current_rom:
         return False
-    gc = srv.current_rom['header']['game_code']
+    gc = _server_mod.current_rom.header['game_code']
     cache = _icr_cache.setdefault(gc, {})
     try:
         entry = {'desc': desc}
@@ -1122,8 +1091,7 @@ def _build_entity_metadata(gc: str):
     - What categories: Personal Data, Learnsets, Trainer Pokemon, etc.
     - What it's related to: Cheren (via Trainer Pokemon), Tackle (via Learnsets), etc.
     """
-    srv = _srv()
-    index = srv.eonet_index.get(gc, [])
+    index = eonet_index.get(gc, [])
 
     for entry in index:
         label = entry.get('label', '')
@@ -1196,12 +1164,10 @@ def resolve_chain(gc: str, start_value: int, start_table: str = None, depth: int
     fc = _file_contents.get(gc, {})
     if not rev or not fc:
         return {'error': 'No relational index built yet — run spotlight first'}
-
-    srv = _srv()
     tables = {}
     for tname in ('species', 'moves', 'items', 'abilities', 'location_names',
                    'trainer_names', 'trainer_classes'):
-        tbl = srv.text_tables.get(tname, [])
+        tbl = (_server_mod.current_rom.text_tables if _server_mod.current_rom else {}).get(tname, [])
         if tbl:
             tables[tname] = tbl
 
@@ -1220,8 +1186,8 @@ def resolve_chain(gc: str, start_value: int, start_table: str = None, depth: int
                 break
 
     # Get narc roles for labeling
-    roles = srv.narc_roles if srv.current_rom and srv.current_rom['header']['game_code'] == gc else \
-        srv.loaded_roms.get(gc, {}).get('narc_roles', {})
+    roles = _server_mod.current_rom.narc_roles if _server_mod.current_rom and _server_mod.current_rom.header['game_code'] == gc else \
+        getattr(_server_mod.loaded_roms.get(gc), 'narc_roles', {})
 
     result = {
         'start': {'value': start_value, 'table': start_table or '?', 'name': start_name},
@@ -1367,7 +1333,6 @@ def _extract_entities_from_query(msg_lower: str, loaded_gcs: list) -> list:
     direct NARC mapping works in _resolve_gc (no more falling through
     to substring search every time).
     """
-    srv = _srv()
     entities = []
     found_names = set()
     words = msg_lower.split()
@@ -1413,7 +1378,7 @@ def _extract_entities_from_query(msg_lower: str, loaded_gcs: list) -> list:
 
             # Look up the entity in the actual text tables
             for tbl_name in candidate_tables:
-                tbl = srv.text_tables.get(tbl_name, [])
+                tbl = (_server_mod.current_rom.text_tables if _server_mod.current_rom else {}).get(tbl_name, [])
                 for idx, entry in enumerate(tbl):
                     if isinstance(entry, str) and entry.strip().lower() == phrase:
                         table = tbl_name
@@ -1446,7 +1411,6 @@ def _bfs_process_narc(path, narc, s, tables, gc, labels_dict, index_entries,
     Returns True if the NARC was labeled (has a desc), False otherwise.
     Skips role assignment for the text NARC.
     """
-    srv = _srv()
     desc = _icr_narc_desc(s, path)
     if desc is not None:
         file_labels = {}
@@ -1482,8 +1446,10 @@ def _bfs_process_narc(path, narc, s, tables, gc, labels_dict, index_entries,
 
     # Assign narc_roles — skip the text NARC.
     # GAME_INFO roles are authoritative and cannot be overwritten by BFS.
-    text_narc_path = srv.GAME_INFO.get(gc, {}).get('narcs', {}).get('text', '')
-    game_narcs = srv.GAME_INFO.get(gc, {}).get('narcs', {})
+    _bpn_spec = SDK.get_spec(gc)
+    _bpn_narcs = SDK.spec_narcs(_bpn_spec) if _bpn_spec else {}
+    text_narc_path = _bpn_narcs.get('text', '')
+    game_narcs = _bpn_narcs
     has_game_role = any(gpath == path and role != 'text' for role, gpath in game_narcs.items())
     if has_game_role:
         # Path has a hardcoded GAME_INFO role — preserve it, don't let BFS override.
@@ -1494,28 +1460,28 @@ def _bfs_process_narc(path, narc, s, tables, gc, labels_dict, index_entries,
         fs = s.get('file_size', 0)
         if idx_tbl == 'species' and s['uniform']:
             if fs == 20:
-                srv.narc_roles[path] = 'pokeathlon_performance'
+                _server_mod.current_rom.narc_roles[path] = 'pokeathlon_performance'
             elif 'moves' in refs:
-                srv.narc_roles[path] = 'battle_facility_pokemon'
+                _server_mod.current_rom.narc_roles[path] = 'battle_facility_pokemon'
             else:
-                srv.narc_roles[path] = 'personal'
+                _server_mod.current_rom.narc_roles[path] = 'personal'
         elif idx_tbl == 'species' and not s['uniform']:
-            srv.narc_roles[path] = 'learnsets'
+            _server_mod.current_rom.narc_roles[path] = 'learnsets'
         elif idx_tbl == 'moves':
-            srv.narc_roles[path] = 'move_data'
+            _server_mod.current_rom.narc_roles[path] = 'move_data'
         elif idx_tbl == 'items':
-            srv.narc_roles[path] = 'items'
+            _server_mod.current_rom.narc_roles[path] = 'items'
         elif idx_tbl == 'trainer_names':
             if 'species' in refs and 'moves' in refs:
-                srv.narc_roles[path] = 'trpoke'
+                _server_mod.current_rom.narc_roles[path] = 'trpoke'
             elif s['uniform'] and fs in (16, 20):
-                srv.narc_roles[path] = 'trdata'
+                _server_mod.current_rom.narc_roles[path] = 'trdata'
             else:
-                srv.narc_roles[path] = 'trpoke' if 'species' in refs else 'trdata'
+                _server_mod.current_rom.narc_roles[path] = 'trpoke' if 'species' in refs else 'trdata'
         elif idx_tbl == 'location_names':
-            srv.narc_roles[path] = 'encounters'
+            _server_mod.current_rom.narc_roles[path] = 'encounters'
         elif refs:
-            srv.narc_roles[path] = '+'.join(sorted(str(r) for r in refs))
+            _server_mod.current_rom.narc_roles[path] = '+'.join(sorted(str(r) for r in refs))
     else:
         return desc is not None
 
@@ -1538,9 +1504,8 @@ def _build_eonet(gc=None):
     following edges until no unvisited connected NARCs remain.
     Graphics/sound never get queued: nothing in the game data references them.
     """
-    srv = _srv()
     if gc is None:
-        gc = srv.current_rom['header']['game_code']
+        gc = _server_mod.current_rom.header['game_code']
 
     # Fast path: restore from cache, skip BFS entirely
     _icr_cache_load(gc)
@@ -1594,18 +1559,21 @@ def _build_eonet(gc=None):
                     'Battle Facility Pokemon': 'battle_facility_pokemon',
                 }
                 role = _ROLE_FROM_DESC.get(label)
-                text_path = srv.GAME_INFO.get(gc, {}).get('narcs', {}).get('text', '')
+                _fp_spec = SDK.get_spec(gc)
+                text_path = SDK.spec_narcs(_fp_spec).get('text', '') if _fp_spec else ''
                 if role and key != text_path:
-                    srv.narc_roles[key] = role
-        srv.eonet_labels[gc] = labels_dict
-        srv.eonet_index[gc] = index_entries
+                    _server_mod.current_rom.narc_roles[key] = role
+        eonet_labels[gc] = labels_dict
+        eonet_index[gc] = index_entries
 
-        # GAME_INFO roles are authoritative — override any ICR cache misidentifications
+        # Spec roles are authoritative — override any ICR cache misidentifications
         # (e.g., trdata mislabeled as trpoke due to blind-scan false species refs)
-        game_info = srv.GAME_INFO.get(gc, {})
-        for role, narc_path in game_info.get('narcs', {}).items():
-            if role != 'text':
-                srv.narc_roles[narc_path] = role
+        _fp_spec2 = SDK.get_spec(gc)
+        _fp_narcs2 = SDK.spec_narcs(_fp_spec2) if _fp_spec2 else {}
+        if _server_mod.current_rom:
+            for role, narc_path in _fp_narcs2.items():
+                if role != 'text':
+                    _server_mod.current_rom.narc_roles[narc_path] = role
 
         # Restore graph from disk cache too
         _graph_cache_load(gc)
@@ -1621,7 +1589,7 @@ def _build_eonet(gc=None):
     val_lookup = _icr_build_val_lookup(tables)
 
     all_narcs = {}
-    rom_type = srv.current_rom.get('type', 'nds')
+    rom_type = getattr(_server_mod.current_rom, 'rom_type', 'nds')
     walker = _walk_all_garcs() if rom_type == '3ds' else _walk_all_narcs()
     for narc_path, narc in walker:
         all_narcs[narc_path] = narc
@@ -1676,7 +1644,8 @@ def _build_eonet(gc=None):
     # The text tables gave us the val_lookup (the decoder ring).
     # Now follow actual values from known NARCs to discover the rest.
     queue = []
-    game_narcs = srv.GAME_INFO.get(gc, {}).get('narcs', {})
+    _be_spec = SDK.get_spec(gc)
+    game_narcs = SDK.spec_narcs(_be_spec) if _be_spec else {}
     for role, narc_path in game_narcs.items():
         if narc_path in all_narcs:
             queue.append(narc_path)
@@ -1713,14 +1682,14 @@ def _build_eonet(gc=None):
                           all_narcs, queue, visited, _connected)
 
     # ARM9, ARM7, overlays — scan for values, queue any connected NARCs.
-    rom = srv.current_rom.get('rom')
+    rom = getattr(_server_mod.current_rom, 'rom', None)
     if rom:
         arm_binaries = {}
         for arm_name in ('arm9', 'arm7'):
-            arm_data = srv.current_rom.get(f'{arm_name}_data') or getattr(rom, arm_name, None)
+            arm_data = getattr(_server_mod.current_rom, f'{arm_name}_data', None) or getattr(rom, arm_name, None)
             if arm_data and len(arm_data) > 100:
                 arm_binaries[f'{arm_name}.bin'] = bytes(arm_data)
-        overlays = srv.current_rom.get('overlays', {})
+        overlays = getattr(_server_mod.current_rom, 'overlays', {})
         for ov_id, ov_data in overlays.items():
             if ov_data and len(ov_data) > 100:
                 arm_binaries[f'overlay{ov_id}.bin'] = bytes(ov_data)
@@ -1784,9 +1753,9 @@ def _build_eonet(gc=None):
         if path in labels_dict:
             labels_dict[path]['cross_refs'] = list(others.keys())
 
-    srv.eonet_labels[gc] = labels_dict
-    srv.eonet_index[gc] = index_entries
-    srv.eonet_labels[gc]['_cross_refs'] = {
+    eonet_labels[gc] = labels_dict
+    eonet_index[gc] = index_entries
+    eonet_labels[gc]['_cross_refs'] = {
         tname: len(paths) for tname, paths in table_to_narcs.items()
     }
 
@@ -1799,18 +1768,20 @@ def _build_eonet(gc=None):
     _flipnote_save()
     _icr_cache_save(gc)
 
-    # GAME_INFO roles are authoritative — override any BFS misidentifications.
-    game_info = srv.GAME_INFO.get(gc, {})
-    for role, narc_path in game_info.get('narcs', {}).items():
-        if role != 'text':
-            srv.narc_roles[narc_path] = role
+    # Spec roles are authoritative — override any BFS misidentifications.
+    _be_spec2 = SDK.get_spec(gc)
+    _be_narcs2 = SDK.spec_narcs(_be_spec2) if _be_spec2 else {}
+    if _server_mod.current_rom:
+        for role, narc_path in _be_narcs2.items():
+            if role != 'text':
+                _server_mod.current_rom.narc_roles[narc_path] = role
 
     # Build entity metadata after full BFS
     _build_entity_metadata(gc)
 
     rev_count = sum(len(v) for v in _reverse_index.get(gc, {}).values())
     fc_count = len(_file_contents.get(gc, {}))
-    print(f"[linkplay] BFS complete for {gc}: {len(narc_structures)} NARCs, "
+    print(f"[Silphéon] BFS complete for {gc}: {len(narc_structures)} NARCs, "
           f"{len(index_entries)} index entries, {len(labels_dict)} labeled, "
           f"{rev_count} graph edges, {fc_count} files indexed",
           file=sys.stderr, flush=True)
@@ -1823,12 +1794,11 @@ def _eonet_search_flipnote(gc, query_lower):
     Manual notes take priority. ICR cache is searched as fallback.
     Returns (results, from_flipnote) where results is list of (key, label).
     """
-    srv = _srv()
     results = []
 
     # Search manual notes first
-    if srv.current_flipnote:
-        notes = srv.current_flipnote['data'].get('notes', {})
+    if _server_mod.current_flipnote:
+        notes = _server_mod.current_flipnote['data'].get('notes', {})
         for key, note_data in notes.items():
             desc = note_data.get('description', '') if isinstance(note_data, dict) else str(note_data)
             if query_lower in desc.lower():
@@ -1918,21 +1888,18 @@ def _build_game_title_map():
     
     Uses actual ROM headers - no hardcoding.
     """
-    srv = _srv()
-    
     # Scan loaded ROMs
-    for gc, state in srv.loaded_roms.items():
-        rom_data = state.get('current_rom', {})
-        header = rom_data.get('header', {})
+    for gc, state in _server_mod.loaded_roms.items():
+        header = getattr(state, 'header', {}) or {}
         title = header.get('game_title', '')
         if title:
             _game_titles[gc] = title.lower()
             _game_abbreviations[gc] = _derive_game_abbreviation(gc, title)
     
     # Scan current ROM
-    if srv.current_rom:
-        gc = srv.current_rom['header']['game_code']
-        title = srv.current_rom['header'].get('game_title', '')
+    if _server_mod.current_rom:
+        gc = _server_mod.current_rom.header['game_code']
+        title = _server_mod.current_rom.header.get('game_title', '')
         if title and gc not in _game_titles:
             _game_titles[gc] = title.lower()
         if gc not in _game_abbreviations:
@@ -2011,9 +1978,9 @@ def _peek_nds_game_code(filepath):
         return None
 
 def _scan_dirs_for_game_code(target_gc):
-    """Scan outward from LinkPlay for an .nds file with matching game code.
+    """Scan outward from Silphéon for an .nds file with matching game code.
 
-    Order: LinkPlay dir -> parent dirs -> common locations (Documents, Downloads, Desktop, drives).
+    Order: Silphéon dir -> parent dirs -> common locations (Documents, Downloads, Desktop, drives).
     Filename checked first as a fast hint; header confirms.
     Returns absolute path string or None.
     """
@@ -2029,11 +1996,11 @@ def _scan_dirs_for_game_code(target_gc):
     }
     hints = name_hints.get(target_gc, [])
 
-    linkplay_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+    Silphéon_dir = Path(os.path.dirname(os.path.abspath(__file__)))
 
-    # Build search order: LinkPlay and parents, then common locations
+    # Build search order: Silphéon and parents, then common locations
     search_dirs = []
-    d = linkplay_dir
+    d = Silphéon_dir
     for _ in range(4):
         search_dirs.append(d)
         if d.parent == d:
@@ -2180,8 +2147,6 @@ def _smart_game_selection(subjects: list, loaded_gcs: list, msg_lower: str) -> l
 
 
 def _resolve_gc(gc, msg, subjects, preferred_refs):
-    srv = _srv()
-
     # --- Step 0: Byte search (deterministic) ---
     # Names → text table index → u16 value → scan NARC bytes.
     # No heuristics. The bytes match or they don't.
@@ -2245,11 +2210,11 @@ def _resolve_gc(gc, msg, subjects, preferred_refs):
     }
 
     # Use gc-specific narc_roles — not always the current ROM's
-    current_gc = srv.current_rom['header']['game_code'] if srv.current_rom else None
+    current_gc = _server_mod.current_rom.header['game_code'] if _server_mod.current_rom else None
     if gc == current_gc:
-        target_narc_roles = srv.narc_roles
-    elif gc in srv.loaded_roms:
-        target_narc_roles = srv.loaded_roms[gc].get('narc_roles', {})
+        target_narc_roles = _server_mod.current_rom.narc_roles if _server_mod.current_rom else {}
+    elif gc in _server_mod.loaded_roms:
+        target_narc_roles = getattr(_server_mod.loaded_roms[gc], 'narc_roles', {})
     else:
         target_narc_roles = {}
 
@@ -2311,9 +2276,9 @@ def _resolve_gc(gc, msg, subjects, preferred_refs):
 
     # Step 3: If still nothing, fall back to eonet_index substring match
     if not paths:
-        if gc in srv.eonet_index and srv.eonet_index[gc]:
+        if gc in eonet_index and eonet_index[gc]:
             for s in subjects:
-                for e in srv.eonet_index[gc]:
+                for e in eonet_index[gc]:
                     if s["name"].lower() in e["name"]:
                         paths.append(e)
 
@@ -2338,16 +2303,15 @@ _CLEAN_GAME_NAMES = {
 
 def _resolve_rom_path(gc):
     """Find the ROM file path for a game code. Single source of truth."""
-    srv = _srv()
-    rp = (srv.loaded_roms.get(gc, {}).get('current_rom') or {}).get('path', '')
-    if not rp and srv.current_rom and srv.current_rom.get('header', {}).get('game_code') == gc:
-        rp = srv.current_rom.get('path', '')
+    rp = getattr(_server_mod.loaded_roms.get(gc), 'rom_path', '')
+    if not rp and _server_mod.current_rom and _server_mod.current_rom.header.get('game_code') == gc:
+        rp = getattr(_server_mod.current_rom, 'rom_path', '')
     if not rp:
         rp = _discovered_roms.get(gc, '')
     if not rp:
         try:
             import json as _jr
-            _reg = _jr.loads((Path.home() / ".linkplay" / "last_rom.json").read_text(encoding='utf-8'))
+            _reg = _jr.loads((Path.home() / ".silphéon" / "last_rom.json").read_text(encoding='utf-8'))
             rp = _reg.get(gc, '')
         except Exception:
             pass
@@ -2360,8 +2324,7 @@ def _format_sliver_block(gc, hits, multi=False):
     multi=False: directive format — '# Game Name' (single winner, use this)
     multi=True:  menu format — '[rom: Game Name (GC)]' (multiple options, pick one)
     """
-    srv = _srv()
-    current_gc = srv.current_rom.get('header', {}).get('game_code') if srv.current_rom else None
+    current_gc = _server_mod.current_rom.header.get('game_code') if _server_mod.current_rom else None
 
     if gc != current_gc:
         dc = ", ".join(f"{gc}:{p['path']} - {p['label']}" for p in hits)
@@ -2371,7 +2334,7 @@ def _format_sliver_block(gc, hits, multi=False):
     rp = _resolve_rom_path(gc)
     t = _CLEAN_GAME_NAMES.get(gc, gc)
     sp = ""
-    if gc not in srv.loaded_roms and rp:
+    if gc not in _server_mod.loaded_roms and rp:
         sp = f"  spotlight: [{rp}]\n"
 
     if multi:
@@ -2406,14 +2369,13 @@ def _byte_search(table_name, value, gc=None):
 
     Returns: list of {narc_path, file_idx, offset, role} for every match.
     """
-    srv = _srv()
     if gc is None:
-        gc = srv.current_rom['header']['game_code'] if srv.current_rom else None
+        gc = _server_mod.current_rom.header['game_code'] if _server_mod.current_rom else None
     if not gc:
         return []
 
     # Get NARC structures — field layouts from BFS/cache
-    labels = srv.eonet_labels.get(gc, {})
+    labels = eonet_labels.get(gc, {})
     results = []
 
     for narc_path, info in labels.items():
@@ -2431,7 +2393,7 @@ def _byte_search(table_name, value, gc=None):
 
         # Get actual NARC bytes from the loaded ROM
         try:
-            narc = srv._get_narc(narc_path)
+            narc = _server_mod.current_rom.get_narc(narc_path)
         except Exception:
             continue
 
@@ -2464,7 +2426,6 @@ def eonet_resolve(message: str, game_code: str = None, prior_context: list = Non
     Conservative: only resolves when CONFIDENT the message is about game data.
     Claude has full conversation context - let it handle ambiguous cases.
     """
-    srv = _srv()
     msg_lower = message.lower().strip()
 
     # Build candidate GC list
@@ -2472,9 +2433,9 @@ def eonet_resolve(message: str, game_code: str = None, prior_context: list = Non
         gcs = [game_code]
     else:
         gcs = []
-        if srv.current_rom:
-            gcs.append(srv.current_rom['header']['game_code'])
-        for _gc in srv.loaded_roms:
+        if _server_mod.current_rom:
+            gcs.append(_server_mod.current_rom.header['game_code'])
+        for _gc in _server_mod.loaded_roms:
             if _gc not in gcs: gcs.append(_gc)
         if not gcs: gcs=_discover_roms_for_query(msg_lower)
         if not gcs: 
@@ -2602,7 +2563,7 @@ async def _test_resolve(message: str, server_script: str = None):
     spec.loader.exec_module(srv)
 
     print("Opening ROM (ICR runs at spotlight — text tables seed everything)...")
-    result = await srv.spotlight(rom_path)
+    result = await _server_mod.spotlight(rom_path)
     gc = result.get('game_code')
     print(f"  Game: {result.get('game_title')} ({gc})")
 
@@ -2619,7 +2580,7 @@ async def _test_resolve(message: str, server_script: str = None):
             print(f"  Cross-refs: {', '.join(f'{k}:{v}' for k, v in top)}")
 
     print(f"\nResolving: \"{message}\"")
-    resolution = srv.eonet_resolve(message, gc)
+    resolution = eonet_resolve(message, gc)
     print(f"  Resolved: {resolution.get('resolved')}")
 
     if resolution.get("resolved"):
@@ -2675,7 +2636,7 @@ def _hosts_redirect_deactivate():
 
 
 def _eonet_pid_path():
-    return Path.home()/'.linkplay'/'eonet.pid'
+    return Path.home()/'.silphéon'/'eonet.pid'
 def _eonet_pid_write():
     try: _eonet_pid_path().write_text(str(os.getpid()))
     except: pass
@@ -2823,7 +2784,7 @@ async def _run_http_eonet_proxy(port: int = 443):
         auto_decompress=False
     )
 
-    _log_path = Path.home() / ".linkplay" / "eonet_proxy.log"
+    _log_path = Path.home() / ".silphéon" / "eonet_proxy.log"
     def _log(msg):
         line = f"[EONET] {msg}"
         print(line, file=_sys.stderr, flush=True)
@@ -2849,7 +2810,6 @@ async def _run_http_eonet_proxy(port: int = 443):
 
         if data is not None and 'prompt' in data:
             user_text = data['prompt']
-            srv = _srv()
             resolution = eonet_resolve(user_text)
             if resolution.get('resolved'):
                 sliver = resolution['sliver']
@@ -2942,8 +2902,8 @@ async def _run_http_eonet_proxy(port: int = 443):
 
     # Use SSL cert if available
     ssl_ctx = None
-    cert_path = Path.home() / ".linkplay" / "eonet_ssl" / "cert.pem"
-    key_path = Path.home() / ".linkplay" / "eonet_ssl" / "key.pem"
+    cert_path = Path.home() / ".silphéon" / "eonet_ssl" / "cert.pem"
+    key_path = Path.home() / ".silphéon" / "eonet_ssl" / "key.pem"
     if cert_path.exists() and key_path.exists():
         import ssl
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -2998,7 +2958,7 @@ async def _run_api_proxy(port: int = 8765):
 
     ANTHROPIC_API = "https://api.anthropic.com"
 
-    _log_path = Path.home() / ".linkplay" / "eonet_api_proxy.log"
+    _log_path = Path.home() / ".silphéon" / "eonet_api_proxy.log"
     def _log(msg):
         line = f"[EONET-API] {msg}"
         print(line, file=_sys.stderr, flush=True)
@@ -3206,6 +3166,22 @@ def _run_proxy():
 
     Usage: python eonet_driver.py --proxy
     """
+    # Jumpstart: load server by path — rename-safe, eonet owns the process
+    global _server_mod
+    import importlib.util
+    _srv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts', 'server.py')
+    _spec = importlib.util.spec_from_file_location('server', _srv_path)
+    _server_mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_server_mod)
+
+    # Inject eonet into server's namespace — server never imports eonet
+    _server_mod.eonet_labels = eonet_labels
+    _server_mod.eonet_index = eonet_index
+    _server_mod._build_eonet = _build_eonet
+    _server_mod.eonet_resolve = eonet_resolve
+    _server_mod._auto_enc_loc = _auto_enc_loc
+    _server_mod.resolve_chain = resolve_chain
+
     def _port_in_use(port):
         """Check if port is bound on IPv4 OR IPv6."""
         import socket
@@ -3253,19 +3229,18 @@ def _run_proxy():
     _skip_443 = _port_in_use(443)
 
     import asyncio
-    srv = _srv()
     from mcp.server.stdio import stdio_server
 
     async def _main():
         async with stdio_server() as (read_stream, write_stream):
-            asyncio.get_event_loop().run_in_executor(None, srv.recover_notes_from_logs)
+            asyncio.get_event_loop().run_in_executor(None, _server_mod.recover_notes_from_logs)
             try:
-                @srv.server.request_handler("eonet/resolve")
+                @_server_mod.server.request_handler("eonet/resolve")
                 async def handle_eonet_resolve(params):
                     return eonet_resolve(params.get("message", ""), params.get("game_code"), params.get("prior_context"))
             except Exception:
                 pass
-            init_options = srv.server.create_initialization_options()
+            init_options = _server_mod.server.create_initialization_options()
             try:
                 caps = init_options.capabilities
                 if not hasattr(caps, 'experimental') or caps.experimental is None:
@@ -3279,7 +3254,7 @@ def _run_proxy():
                 pass
             intercepted_read = _EonetInterceptStream(read_stream)
             try:
-                await srv.server.run(intercepted_read, write_stream, init_options)
+                await _server_mod.server.run(intercepted_read, write_stream, init_options)
             except Exception:
                 pass
 
@@ -3328,7 +3303,6 @@ def _run_proxy():
     atexit.register(_settings_remove_base_url)
 
     async def _run_all():
-        srv.ensure_dirs()
 
         # setup_tools() checks/installs compression tools.
         # Runs in a thread so filesystem checks (Windows Defender scans
@@ -3514,7 +3488,7 @@ class _EonetInterceptStream:
 
 
 def _eonet_ssl_dir() -> Path:
-    d = Path.home() / ".linkplay" / "eonet_ssl"
+    d = Path.home() / ".silphéon" / "eonet_ssl"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -3632,7 +3606,7 @@ def _eonet_setup():
     import shutil, os
     uv_exe = shutil.which('uv') or r'uv'
     driver_path = os.path.abspath(__file__)
-    linkplay_dir = os.path.dirname(driver_path)
+    Silphéon_dir = os.path.dirname(driver_path)
     xml = f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers>
@@ -3655,7 +3629,7 @@ def _eonet_setup():
     <Exec>
       <Command>{uv_exe}</Command>
       <Arguments>run pythonw eonet_driver.py --proxy</Arguments>
-      <WorkingDirectory>{linkplay_dir}</WorkingDirectory>
+      <WorkingDirectory>{Silphéon_dir}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>"""
@@ -3664,14 +3638,14 @@ def _eonet_setup():
         tf.write(xml)
         xml_path = tf.name
     r2 = subprocess.run(
-        ['schtasks', '/Create', '/F', '/TN', 'LinkPlayEonet', '/XML', xml_path],
+        ['schtasks', '/Create', '/F', '/TN', 'SilphéonEonet', '/XML', xml_path],
         capture_output=True, text=True
     )
     os.unlink(xml_path)
     if r2.returncode != 0:
         print(f"  WARNING: Scheduled task registration failed: {r2.stderr.strip()}")
     else:
-        print("  Scheduled task 'LinkPlayEonet' registered — proxy will auto-start at logon.")
+        print("  Scheduled task 'SilphéonEonet' registered — proxy will auto-start at logon.")
     print("\nSetup complete. Proxy will now auto-start at each logon via scheduled task.")
 
 
@@ -3750,7 +3724,7 @@ def _eonet_teardown():
     # Remove scheduled task
     print("Removing scheduled task...")
     r3 = subprocess.run(
-        ['schtasks', '/Delete', '/F', '/TN', 'LinkPlayEonet'],
+        ['schtasks', '/Delete', '/F', '/TN', 'SilphéonEonet'],
         capture_output=True, text=True
     )
     if r3.returncode != 0:

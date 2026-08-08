@@ -4,6 +4,7 @@ from xoleon import (
     _GEN4_HIRAGANA, _GEN4_KATAKANA, _GEN4_FULLWIDTH_SYMBOLS, _GEN4_SPECIAL,
     _get_gen4_char, decode_gen4_text,
 )
+from Generations.sdk import MOVE_CATEGORIES_G4
 
 
 # ============================================================
@@ -463,4 +464,3 @@ _GEN4_TM_SEARCH = {
     4: (bytes([0x08, 0x01, 0x51, 0x01, 0x60, 0x01, 0x5B, 0x01]), 100),  # 92 TMs + 8 HMs
 }
 
-MOVE_CATEGORIES_G4 = {0: "Physical", 1: "Special", 2: "Status"}

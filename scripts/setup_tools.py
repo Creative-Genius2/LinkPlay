@@ -347,7 +347,7 @@ def get_tool_path(tool_name):
 
 if __name__ == "__main__":
     # When run directly (not as MCP server), allow interactive download
-    print("LinkPlay Tool Setup")
+    print("Silphéon Tool Setup")
     print("=" * 40)
     
     if check_tools_installed():

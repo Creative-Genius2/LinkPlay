@@ -7,13 +7,8 @@
 !scripts/setup_tools.py
 !Generations/
 !Generations/*.py
-# Not yet supported — don't ship what doesn't work
-Generations/gen6_xy_oras.py
-Generations/gen8_swsh.py
-Generations/gen9_scarvio.py
 !eonet_driver.py
 !eonet_launcher.py
-!xoleon.py
 
 # Docs + config
 !README.md
@@ -23,7 +18,6 @@ Generations/gen9_scarvio.py
 !our_mcp_config.json
 !requirements.txt
 !LICENSE
-!Iterative_Cross_Referencing 2.docx
 !docs/
 !docs/*.md
 !.gitignore
@@ -31,7 +25,8 @@ Generations/gen9_scarvio.py
 # Local tools — not part of the server
 server-to-Gens.py
 
-# Build artifacts
+# Build artifacts (dont push)
 dist/
 build/
 *.egg-info/
+keys/

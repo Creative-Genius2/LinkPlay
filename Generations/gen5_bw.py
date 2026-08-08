@@ -1,6 +1,7 @@
 """Gen V (Black/White/Black2/White2) - text decoder, NARC paths, PWT, encounters."""
 import struct
 from xoleon import _GEN5_CHARMAP, derive_gen5_mult as _derive_gen5_mult, decode_gen5_text
+from Generations.sdk import MOVE_CATEGORIES as MOVE_CATEGORIES_G5
 
 # ============================================================
 # # _GEN5_B2W2, _GEN5_BW1, encounters, PWT, subway NARC dicts
@@ -818,7 +819,6 @@ _GEN5_TM_SEARCH = {
     5: (bytes([0xD4, 0x01, 0x51, 0x01, 0xD9, 0x01, 0x5B, 0x01]), 101),  # 95 TMs + 6 HMs
 }
 
-MOVE_CATEGORIES_G5 = {0: "Status", 1: "Physical", 2: "Special"}
 
 _FORM_NAMES = {
     (351, 1): "Sunny", (351, 2): "Rainy", (351, 3): "Snowy",
